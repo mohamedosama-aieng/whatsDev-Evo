@@ -1,18 +1,65 @@
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
+import { DbService } from './db.service';
 
 export interface WebhookConfig {
   url: string;
   enabled: boolean;
+  /**
+   * Forward messages that arrive from a WhatsApp group (JID ending @g.us).
+   *
+   * true  - group messages are forwarded to n8n (previous behaviour)
+   * false - group messages are dropped here and never reach n8n
+   *
+   * Defaults to true everywhere so an instance registered before this option
+   * existed keeps behaving exactly as it did.
+   */
+  groupMessages: boolean;
+  /**
+   * Forward messages the instance itself sent (key.fromMe === true).
+   *
+   * true  - own outgoing messages are forwarded to n8n (previous behaviour)
+   * false - own outgoing messages are dropped here and never reach n8n
+   *
+   * Worth knowing why this matters: Evolution's MESSAGES_UPSERT fires for
+   * outgoing messages too, so a flow that replies to every inbound message can
+   * see its own reply come back and answer itself. Turning this off breaks that
+   * loop at the source instead of needing a fromMe guard in every n8n flow.
+   *
+   * Defaults to true everywhere so an instance registered before this option
+   * existed keeps behaving exactly as it did.
+   */
+  fromMeMessages: boolean;
 }
+
+/** Outcome of an attempted forward, so callers can tell "dropped" from "failed". */
+export type SendWebhookResult = {
+  sent: boolean;
+  reason?: 'no-webhook' | 'group-filtered' | 'from-me-filtered' | 'send-failed';
+};
 
 export interface WebhookPayload {
   uuid: string;
   event: string;
   timestamp: number;
+  /**
+   * Sender, duplicated at the root so consumers can read body.from without
+   * reaching into body.data. Always the same value as data.from - both are
+   * assigned from one variable in transformMessage so they cannot drift.
+   * data.from is kept as-is: removing it would break every existing n8n flow.
+   */
+  from: string;
   data: {
     from: string;
+    /** Full sender JID. For unresolved LIDs this is the only safe reply target. */
+    fromJid: string;
+    /** Public phone number when WhatsApp supplied/resolved one; empty for an unresolved LID. */
+    fromPhone?: string;
+    /** Target to pass back to the send API. It may be a phone number or a full @lid JID. */
+    replyTo: string;
+    /** Original Local Identifier when the incoming message used @lid. */
+    fromLid?: string;
     fromName?: string;
     to: string;
     message?: {
@@ -29,6 +76,13 @@ export interface WebhookPayload {
     };
     messageId: string;
     isGroup: boolean;
+    /**
+     * True when the instance itself sent this message, straight from
+     * Evolution's key.fromMe. Exposed in the payload (not just used for
+     * filtering) so a flow that keeps own messages forwarded can still tell
+     * inbound from outbound without inspecting jids.
+     */
+    fromMe: boolean;
     groupName?: string;
     isAd?: boolean;
     adMetadata?: {
@@ -42,13 +96,21 @@ export interface WebhookPayload {
 
 export class WebhookService {
   private static instance: WebhookService;
+
+  /**
+   * Write-through cache of instance name -> n8n target.
+   *
+   * Postgres is the source of truth (table wd_backend_webhook). This map only
+   * exists so lookups on the hot path (every inbound WhatsApp message) and the
+   * synchronous getWebhook() callers do not need to await a query.
+   */
   private webhooks: Map<string, WebhookConfig> = new Map();
-  private storageFile: string;
+
+  /** Legacy store, read once at boot and then migrated into Postgres. */
+  private legacyFile: string;
 
   private constructor() {
-    // Store webhooks in a JSON file for persistence
-    this.storageFile = path.join(process.cwd(), '.webhooks.json');
-    this.loadWebhooks();
+    this.legacyFile = path.join(process.cwd(), '.webhooks.json');
   }
 
   /**
@@ -62,58 +124,216 @@ export class WebhookService {
   }
 
   /**
-   * Load webhooks from file
+   * Load from Postgres, importing .webhooks.json the first time.
+   *
+   * Must be awaited during startup, before anything reads the cache.
+   *
+   * Why this replaced the JSON file: the path was
+   * `path.join(process.cwd(), '.webhooks.json')`, so the mapping was tied to
+   * whatever directory the process happened to start in. Launched from another
+   * folder, the backend came up with zero webhooks and no error - the reported
+   * "webhook URL does not come back after a restart".
    */
-  private loadWebhooks() {
+  async init(): Promise<void> {
+    const db = DbService.getInstance();
+    if (!db.isReady()) {
+      console.warn('[Webhook] DB not ready; falling back to legacy file (not persisted)');
+      this.loadLegacyIntoCache();
+      return;
+    }
+
+    await this.migrateLegacyFile();
+
+    const rows = await db.getAllWebhooks();
+    this.webhooks = new Map(
+      rows.map((r) => [
+        r.instance_name,
+        {
+          url: r.url,
+          enabled: r.enabled,
+          groupMessages: r.group_messages !== false,
+          fromMeMessages: r.from_me_messages !== false,
+        },
+      ]),
+    );
+    console.log(`[Webhook] Loaded ${this.webhooks.size} webhook(s) from Postgres`);
+  }
+
+  /** Degraded path only: cache without persistence. */
+  private loadLegacyIntoCache() {
     try {
-      if (fs.existsSync(this.storageFile)) {
-        const data = fs.readFileSync(this.storageFile, 'utf-8');
-        const webhooks = JSON.parse(data);
-        this.webhooks = new Map(Object.entries(webhooks));
-        console.log(`[Webhook] Loaded ${this.webhooks.size} webhook(s) from storage`);
+      if (fs.existsSync(this.legacyFile)) {
+        const data = JSON.parse(fs.readFileSync(this.legacyFile, 'utf-8'));
+        this.webhooks = new Map(Object.entries(data) as Array<[string, WebhookConfig]>);
+        console.log(`[Webhook] Loaded ${this.webhooks.size} webhook(s) from legacy file`);
       }
     } catch (error) {
-      console.error('[Webhook] Failed to load webhooks:', error);
+      console.error('[Webhook] Failed to read legacy file:', error);
     }
   }
 
   /**
-   * Save webhooks to file
+   * Copy .webhooks.json rows into Postgres without clobbering newer DB values.
+   * Insert-if-absent, so re-running is harmless. The file is left on disk and
+   * renamed to .migrated so a bad migration stays diagnosable.
    */
-  private saveWebhooks() {
+  private async migrateLegacyFile(): Promise<void> {
+    if (!fs.existsSync(this.legacyFile)) return;
+
+    const db = DbService.getInstance();
     try {
-      const data = Object.fromEntries(this.webhooks);
-      fs.writeFileSync(this.storageFile, JSON.stringify(data, null, 2));
-    } catch (error) {
-      console.error('[Webhook] Failed to save webhooks:', error);
+      const data = JSON.parse(fs.readFileSync(this.legacyFile, 'utf-8')) as Record<string, WebhookConfig>;
+      let imported = 0;
+
+      for (const [key, cfg] of Object.entries(data)) {
+        if (!cfg?.url) continue;
+        // Keys in the file may be a name or a UUID; normalise to the name.
+        const canonical = (await db.resolveInstanceName(key)) ?? key;
+        // Legacy rows predate group_messages and from_me_messages, so both
+        // fields are undefined here and resolve to true - the behaviour those
+        // rows already had.
+        if (
+          await db.insertWebhookIfAbsent(
+            canonical,
+            cfg.url,
+            cfg.enabled !== false,
+            cfg.groupMessages !== false,
+            cfg.fromMeMessages !== false,
+          )
+        ) {
+          imported++;
+          console.log(`[Webhook] Migrated ${key} -> ${canonical}`);
+        }
+      }
+
+      console.log(`[Webhook] Legacy migration: ${imported} row(s) imported`);
+      fs.renameSync(this.legacyFile, `${this.legacyFile}.migrated`);
+    } catch (error: any) {
+      console.error('[Webhook] Legacy migration failed:', error.message);
     }
   }
 
   /**
-   * Register webhook URL for an instance/UUID
+   * Register the n8n target for an instance.
+   *
+   * `instanceKey` may be a name or a UUID; it is normalised to the canonical
+   * instance name so that inbound messages (which carry the name) match what
+   * the Manager UI registered (which uses the UUID).
    */
-  registerWebhook(uuid: string, url: string, enabled: boolean = true) {
-    this.webhooks.set(uuid, { url, enabled });
-    this.saveWebhooks();
-    console.log(`[Webhook] Registered for UUID: ${uuid} → ${url}`);
+  async registerWebhook(
+    instanceKey: string,
+    url: string,
+    enabled: boolean = true,
+    groupMessages: boolean = true,
+    fromMeMessages: boolean = true,
+  ): Promise<string> {
+    const db = DbService.getInstance();
+    let key = instanceKey;
+
+    if (db.isReady()) {
+      key = (await db.resolveInstanceName(instanceKey)) ?? instanceKey;
+      await db.upsertWebhook(key, url, enabled, groupMessages, fromMeMessages);
+    } else {
+      console.warn(`[Webhook] DB not ready; ${key} registered in memory only`);
+    }
+
+    const config: WebhookConfig = { url, enabled, groupMessages, fromMeMessages };
+    const flags = `groups: ${groupMessages}, fromMe: ${fromMeMessages}`;
+
+    this.webhooks.set(key, config);
+    if (key !== instanceKey) {
+      // Keep the alias resolvable in-process so a caller using the UUID still hits.
+      // A separate object, not the same reference: sharing one would let a later
+      // in-place edit of either entry silently change the other.
+      this.webhooks.set(instanceKey, { ...config });
+      console.log(`[Webhook] Registered for ${instanceKey} (as ${key}) → ${url} (${flags})`);
+    } else {
+      console.log(`[Webhook] Registered for ${key} → ${url} (${flags})`);
+    }
+    return key;
   }
 
   /**
-   * Get webhook config for UUID
+   * Get webhook config. Reads the cache, so it stays synchronous for existing
+   * callers; the cache is filled by init() and kept current by registerWebhook.
    */
-  getWebhook(uuid: string): WebhookConfig | undefined {
-    return this.webhooks.get(uuid);
+  getWebhook(instanceKey: string): WebhookConfig | undefined {
+    return this.webhooks.get(instanceKey);
+  }
+
+  /** Bypass the cache and read Postgres directly. */
+  async getWebhookFresh(instanceKey: string): Promise<WebhookConfig | undefined> {
+    const db = DbService.getInstance();
+    if (!db.isReady()) return this.webhooks.get(instanceKey);
+
+    const key = (await db.resolveInstanceName(instanceKey)) ?? instanceKey;
+    const row = await db.getWebhook(key);
+    return row
+      ? {
+          url: row.url,
+          enabled: row.enabled,
+          groupMessages: row.group_messages !== false,
+          fromMeMessages: row.from_me_messages !== false,
+        }
+      : undefined;
+  }
+
+  /** Every registered mapping (used by the status endpoint). */
+  listWebhooks(): Array<{
+    instanceName: string;
+    url: string;
+    enabled: boolean;
+    groupMessages: boolean;
+    fromMeMessages: boolean;
+  }> {
+    return Array.from(this.webhooks.entries()).map(([instanceName, cfg]) => ({
+      instanceName,
+      url: cfg.url,
+      enabled: cfg.enabled,
+      groupMessages: cfg.groupMessages !== false,
+      fromMeMessages: cfg.fromMeMessages !== false,
+    }));
   }
 
   /**
-   * Send webhook payload
+   * Send webhook payload.
+   *
+   * Returns a reason rather than a bare false so the caller can tell a
+   * deliberate skip (group filtering) apart from a misconfiguration. Logging
+   * "No active webhook" for a filtered group message was actively misleading.
    */
-  async sendWebhook(uuid: string, payload: WebhookPayload): Promise<boolean> {
-    const config = this.webhooks.get(uuid);
+  async sendWebhook(uuid: string, payload: WebhookPayload): Promise<SendWebhookResult> {
+    let config = this.webhooks.get(uuid);
+
+    // Cache miss can mean the row was written by another process (or this one
+    // booted before it existed), so confirm against the DB before giving up.
+    if (!config) {
+      config = await this.getWebhookFresh(uuid);
+      if (config) this.webhooks.set(uuid, config);
+    }
 
     if (!config || !config.enabled) {
       console.log(`[Webhook] No active webhook for UUID: ${uuid}`);
-      return false;
+      return { sent: false, reason: 'no-webhook' };
+    }
+
+    // Group filter. Undefined counts as enabled so a row written before this
+    // column existed, or a degraded in-memory entry, keeps forwarding.
+    if (payload.data?.isGroup && config.groupMessages === false) {
+      console.log(
+        `[Webhook] Skipped group message for ${uuid} (group messages disabled): ${payload.data.messageId}`,
+      );
+      return { sent: false, reason: 'group-filtered' };
+    }
+
+    // Own-message filter, same `=== false` shape and for the same reason: a row
+    // predating the column, or an in-memory entry from the degraded path, has
+    // undefined here and must keep forwarding.
+    if (payload.data?.fromMe && config.fromMeMessages === false) {
+      console.log(
+        `[Webhook] Skipped own message for ${uuid} (fromMe messages disabled): ${payload.data.messageId}`,
+      );
+      return { sent: false, reason: 'from-me-filtered' };
     }
 
     try {
@@ -126,11 +346,37 @@ export class WebhookService {
       });
 
       console.log(`[Webhook] Sent to ${config.url} for UUID: ${uuid}`);
-      return true;
+      return { sent: true };
     } catch (error: any) {
       console.error(`[Webhook] Failed to send to ${config.url}:`, error.message);
-      return false;
+      return { sent: false, reason: 'send-failed' };
     }
+  }
+
+  /**
+   * Is this message from a WhatsApp group?
+   *
+   * Groups are identified by the @g.us suffix. remoteJid is the normal carrier,
+   * but participant (the individual sender inside a group) and the message id
+   * are checked too, because on some Evolution payload shapes - notably @lid
+   * senders - remoteJid is not the group jid.
+   */
+  isGroupMessage(evolutionMessage: any): boolean {
+    const key = evolutionMessage?.key || {};
+    const candidates = [key.remoteJid, key.participant, key.id, evolutionMessage?.participant];
+    return candidates.some((value) => typeof value === 'string' && value.includes('@g.us'));
+  }
+
+  /**
+   * Did the instance itself send this message?
+   *
+   * key.fromMe is Evolution's own flag, so this is a read rather than a guess.
+   * Coerced with === true because the field is occasionally absent on some
+   * payload shapes, and `undefined` must mean inbound - not be passed through
+   * as a falsy-but-not-false value that the filter then has to interpret.
+   */
+  isFromMe(evolutionMessage: any): boolean {
+    return evolutionMessage?.key?.fromMe === true;
   }
 
   /**
@@ -143,9 +389,18 @@ export class WebhookService {
     const message = evolutionMessage.message || {};
     const messageType = this.detectMessageType(message);
 
-    // Extract phone number from remoteJid (remove @s.whatsapp.net or @c.us)
-    const fromJid = key.remoteJid || '';
-    const fromPhone = fromJid.split('@')[0];
+    // Prefer Evolution's resolved public JID. If the message is still a LID,
+    // keep the complete @lid value because stripping the suffix turns it into
+    // a different (and undeliverable) WhatsApp number.
+    const rawFromJid = key.remoteJid || '';
+    const fromJid = rawFromJid.includes('@lid') && key.remoteJidAlt
+      ? key.remoteJidAlt
+      : rawFromJid;
+    const fromPhone = fromJid && !fromJid.includes('@lid') ? fromJid.split('@')[0] : '';
+    const fromLid = key.remoteJidLid || (rawFromJid.includes('@lid') ? rawFromJid : undefined);
+    // Resolved once and used for both payload.from and payload.data.from, so
+    // the root-level copy can never disagree with the nested one.
+    const from = fromPhone || fromJid;
 
     // Use mediaUrl from Evolution (local CDN) if available
     // If not available, we'll construct it based on LOCAL_STORAGE pattern
@@ -164,12 +419,24 @@ export class WebhookService {
             ? evolutionMessage.messageTimestamp * 1000
             : evolutionMessage.messageTimestamp)
         : Date.now(),
+      from,
       data: {
-        from: fromPhone || fromJid,
+        from,
+        fromJid,
+        fromPhone,
+        replyTo: fromJid,
+        fromLid,
         fromName: evolutionMessage.pushName || '',
-        to: key.participant || key.remoteJid || '',
+        // For a direct chat this is the same safe target as replyTo. Keep the
+        // participant for group messages, where it identifies the sender.
+        to: this.isGroupMessage(evolutionMessage) ? key.participant || key.remoteJid || '' : fromJid,
         messageId: key.id || '',
-        isGroup: key.remoteJid?.endsWith('@g.us') || false,
+        // Via the helper so the payload flag and the group filter in
+        // sendWebhook can never disagree about what counts as a group.
+        isGroup: this.isGroupMessage(evolutionMessage),
+        // Same reasoning: one helper feeds both the payload field and the
+        // fromMe filter, so they cannot drift apart.
+        fromMe: this.isFromMe(evolutionMessage),
         groupName: evolutionMessage.groupName || '',
       },
     };

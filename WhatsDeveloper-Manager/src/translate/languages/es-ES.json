@@ -363,6 +363,14 @@
         "label": "Webhook Base64",
         "description": "Enviar datos de medios en base64 en el webhook"
       },
+      "groupMessages": {
+        "label": "Mensajes de Grupo",
+        "description": "Reenviar los mensajes provenientes de grupos (@g.us). Desactívalo para ignorar los mensajes de grupo y enviar solo los chats directos"
+      },
+      "fromMeMessages": {
+        "label": "Mensajes Propios",
+        "description": "Reenviar los mensajes enviados por esta instancia (fromMe). Desactívalo para bloquear mensajes salientes y prevenir bucles de respuesta"
+      },
       "events": {
         "label": "Eventos"
       }

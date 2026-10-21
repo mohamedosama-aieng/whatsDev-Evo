@@ -27,6 +27,8 @@ const FormSchema = z.object({
   events: z.array(z.string()),
   base64: z.boolean(),
   byEvents: z.boolean(),
+  groupMessages: z.boolean(),
+  fromMeMessages: z.boolean(),
 });
 
 type FormSchemaType = z.infer<typeof FormSchema>;
@@ -82,6 +84,11 @@ function Webhook() {
       events: [],
       base64: false,
       byEvents: false,
+      // Both default on: match the Backend defaults, so opening this page and
+      // saving without touching either switch does not start dropping groups or
+      // own messages.
+      groupMessages: true,
+      fromMeMessages: true,
     },
   });
 
@@ -93,6 +100,11 @@ function Webhook() {
         events: webhook.events,
         base64: webhook.webhookBase64,
         byEvents: webhook.webhookByEvents,
+        // `?? true` and not `|| false`: the Evolution fallback response has no
+        // groupMessages or fromMeMessages fields at all, and absent must read as
+        // on for both.
+        groupMessages: webhook.groupMessages ?? true,
+        fromMeMessages: webhook.fromMeMessages ?? true,
       });
     }
   }, [webhook]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -107,6 +119,8 @@ function Webhook() {
         events: data.events,
         base64: data.base64,
         byEvents: data.byEvents,
+        groupMessages: data.groupMessages,
+        fromMeMessages: data.fromMeMessages,
       };
 
       await createWebhook({
@@ -147,6 +161,8 @@ function Webhook() {
               </FormInput>
               {!isGo && <FormSwitch name="byEvents" label={t("webhook.form.byEvents.label")} className="w-full justify-between" helper={t("webhook.form.byEvents.description")} />}
               {!isGo && <FormSwitch name="base64" label={t("webhook.form.base64.label")} className="w-full justify-between" helper={t("webhook.form.base64.description")} />}
+              {!isGo && <FormSwitch name="groupMessages" label={t("webhook.form.groupMessages.label")} className="w-full justify-between" helper={t("webhook.form.groupMessages.description")} />}
+              {!isGo && <FormSwitch name="fromMeMessages" label={t("webhook.form.fromMeMessages.label")} className="w-full justify-between" helper={t("webhook.form.fromMeMessages.description")} />}
               <div className="mb-4 flex justify-between">
                 <Button variant="outline" type="button" onClick={handleSelectAll}>
                   {t("button.markAll")}
@@ -163,7 +179,11 @@ function Webhook() {
                     <FormLabel className="my-2 text-lg">{t("webhook.form.events.label")}</FormLabel>
                     <FormControl>
                       <div className="flex flex-col gap-2 space-y-1 divide-y">
-                        {events
+                        {/* Spread before sort: `events` is one of the two
+                            module-level constants above, and sort mutates in
+                            place - the original arrays were being permanently
+                            reordered on first render. */}
+                        {[...events]
                           .sort((a, b) => a.localeCompare(b))
                           .map((event) => (
                             <div key={event} className="flex items-center justify-between gap-3 pt-3">

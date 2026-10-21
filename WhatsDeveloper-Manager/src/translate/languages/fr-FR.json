@@ -63,13 +63,13 @@
         "closed": "Fermée"
       },
       "timeOptions": {
-        "all": "À tout moment",
         "5": "Dernières 5 minutes",
         "10": "Dernières 10 minutes",
         "15": "Dernières 15 minutes",
         "20": "Dernières 20 minutes",
         "30": "Dernières 30 minutes",
         "60": "Dernières 60 minutes",
+        "all": "À tout moment",
         ">60": "Plus de 60 minutes",
         ">120": "Plus de 2 heures",
         ">300": "Plus de 5 heures",
@@ -362,8 +362,20 @@
         "label": "Webhook Base64",
         "description": "Envoyer des données médias en base64 dans le webhook"
       },
+      "groupMessages": {
+        "label": "Messages de Groupe",
+        "description": "Transférer les messages provenant des groupes (@g.us). Désactivez pour ignorer les messages de groupe et n'envoyer que les discussions directes"
+      },
+      "fromMeMessages": {
+        "label": "Messages Propres",
+        "description": "Transférer les messages envoyés par cette instance (fromMe). Désactivez pour bloquer les messages sortants et éviter les boucles de réponse"
+      },
       "events": {
         "label": "Événements"
+      },
+      "fromMeMessages": {
+        "label": "Messages Propres",
+        "description": "Transférer les messages envoyés par cette instance (fromMe). Désactivez pour bloquer les messages sortants et éviter les boucles de réponse"
       }
     },
     "button": {

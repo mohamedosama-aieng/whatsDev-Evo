@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
-import axios from 'axios';
 import { EvolutionService } from '../services/evolution.service';
+import { AuthedRequest } from '../middleware/auth.middleware';
 import { resolveSpintax, formatPhoneNumber, delay } from '../services/utils.service';
 
 interface MessageBase {
@@ -86,13 +86,39 @@ interface MessageResult {
   error?: string;
 }
 
+/**
+ * Which profile this sequence sends as. Both fields come from the auth
+ * middleware and must be forwarded to every EvolutionService call.
+ *
+ * This replaced a bare `apiToken: string` that was threaded through each
+ * helper. Two problems with that:
+ *
+ *   1. instanceName was never passed, so EvolutionService fell back to
+ *      DEFAULT_INSTANCE_NAME. The request URL therefore named the default
+ *      profile while carrying another profile's token, which Evolution
+ *      rejects - sequences could only ever work for the default instance.
+ *
+ *   2. sendAudio takes `ptt` before `instanceName`, so the 4-argument call
+ *      `sendAudio(phone, url, undefined, apiToken)` put the token in the
+ *      instanceName slot and sent to an instance named after the token.
+ *
+ * Passing an object instead of positional extras makes that class of mistake
+ * hard to repeat.
+ */
+interface Target {
+  instance?: string;
+  key?: string;
+}
+
 export class SequenceController {
   constructor(private evolutionService: EvolutionService) {}
 
   async sendSequence(req: Request, res: Response) {
     try {
       const { to, messages, delayMs = 3000 }: SequenceRequest = req.body;
-      const apiToken = (req as any).apiToken; // From auth middleware
+
+      const areq = req as AuthedRequest;
+      const target: Target = { instance: areq.instanceName, key: areq.instanceKey };
 
       // Validation
       if (!to) {
@@ -117,11 +143,11 @@ export class SequenceController {
       }
 
       // Check instance availability
-      const isAvailable = await this.evolutionService.isInstanceAvailable(undefined, apiToken);
+      const isAvailable = await this.evolutionService.isInstanceAvailable(target.instance, target.key);
       if (!isAvailable) {
         return res.status(400).json({
           success: false,
-          error: 'WhatsApp client not available',
+          error: `WhatsApp client not available for instance "${target.instance ?? 'default'}"`,
         });
       }
 
@@ -146,37 +172,37 @@ export class SequenceController {
 
           switch (msgType) {
             case 'text':
-              result = await this.sendTextMessage(phone, msg as TextMessage, apiToken);
+              result = await this.sendTextMessage(phone, msg as TextMessage, target);
               break;
 
             case 'image':
-              result = await this.sendImageMessage(phone, msg as ImageMessage, apiToken);
+              result = await this.sendImageMessage(phone, msg as ImageMessage, target);
               break;
 
             case 'video':
-              result = await this.sendVideoMessage(phone, msg as VideoMessage, apiToken);
+              result = await this.sendVideoMessage(phone, msg as VideoMessage, target);
               break;
 
             case 'audio':
             case 'voice':
             case 'ptt':
-              result = await this.sendAudioMessage(phone, msg as AudioMessage, apiToken);
+              result = await this.sendAudioMessage(phone, msg as AudioMessage, target);
               break;
 
             case 'document':
-              result = await this.sendDocumentMessage(phone, msg as DocumentMessage, apiToken);
+              result = await this.sendDocumentMessage(phone, msg as DocumentMessage, target);
               break;
 
             case 'location':
-              result = await this.sendLocationMessage(phone, msg as LocationMessage, apiToken);
+              result = await this.sendLocationMessage(phone, msg as LocationMessage, target);
               break;
 
             case 'contact':
-              result = await this.sendContactMessage(phone, msg as ContactMessage, apiToken);
+              result = await this.sendContactMessage(phone, msg as ContactMessage, target);
               break;
 
             case 'catalog':
-              result = await this.sendCatalogMessage(phone, msg as CatalogMessage, apiToken);
+              result = await this.sendCatalogMessage(phone, msg as CatalogMessage, target);
               break;
 
             default:
@@ -216,6 +242,7 @@ export class SequenceController {
         failed: failedCount,
         total: messages.length,
         chatId,
+        instance: target.instance,
         results,
         timestamp: new Date().toISOString(),
       });
@@ -227,40 +254,40 @@ export class SequenceController {
     }
   }
 
-  private async sendTextMessage(phone: string, msg: TextMessage, apiToken: string) {
+  private async sendTextMessage(phone: string, msg: TextMessage, t: Target) {
     if (!msg.content) {
       throw new Error('Text message requires "content" field');
     }
 
     const content = resolveSpintax(msg.content);
-    return await this.evolutionService.sendText(phone, content, undefined, apiToken);
+    return await this.evolutionService.sendText(phone, content, t.instance, t.key);
   }
 
-  private async sendImageMessage(phone: string, msg: ImageMessage, apiToken: string) {
+  private async sendImageMessage(phone: string, msg: ImageMessage, t: Target) {
     if (!msg.url && !msg.base64) {
       throw new Error('Image requires "url" or "base64" field');
     }
 
     if (msg.base64) {
-      return await this.evolutionService.sendMediaBase64(phone, msg.base64, 'image', msg.caption, undefined, apiToken);
+      return await this.evolutionService.sendMediaBase64(phone, msg.base64, 'image', msg.caption, t.instance, t.key);
     } else {
-      return await this.evolutionService.sendImage(phone, msg.url!, msg.caption, undefined, apiToken);
+      return await this.evolutionService.sendImage(phone, msg.url!, msg.caption, t.instance, t.key);
     }
   }
 
-  private async sendVideoMessage(phone: string, msg: VideoMessage, apiToken: string) {
+  private async sendVideoMessage(phone: string, msg: VideoMessage, t: Target) {
     if (!msg.url && !msg.base64) {
       throw new Error('Video requires "url" or "base64" field');
     }
 
     if (msg.base64) {
-      return await this.evolutionService.sendMediaBase64(phone, msg.base64, 'video', msg.caption, undefined, apiToken);
+      return await this.evolutionService.sendMediaBase64(phone, msg.base64, 'video', msg.caption, t.instance, t.key);
     } else {
-      return await this.evolutionService.sendVideo(phone, msg.url!, msg.caption, undefined, apiToken);
+      return await this.evolutionService.sendVideo(phone, msg.url!, msg.caption, t.instance, t.key);
     }
   }
 
-  private async sendAudioMessage(phone: string, msg: AudioMessage, apiToken: string) {
+  private async sendAudioMessage(phone: string, msg: AudioMessage, t: Target) {
     if (!msg.url && !msg.base64) {
       throw new Error('Audio requires "url" or "base64" field');
     }
@@ -269,13 +296,15 @@ export class SequenceController {
 
     if (msg.base64) {
       // For base64 audio, use sendMediaBase64
-      return await this.evolutionService.sendMediaBase64(phone, msg.base64, 'audio', undefined, undefined, apiToken);
+      return await this.evolutionService.sendMediaBase64(phone, msg.base64, 'audio', undefined, t.instance, t.key);
     } else {
-      return await this.evolutionService.sendAudio(phone, msg.url!, undefined, apiToken);
+      // NOTE the argument order: (phone, audioUrl, ptt, instanceName, apiKey).
+      // isPtt was previously computed and then dropped on the floor here.
+      return await this.evolutionService.sendAudio(phone, msg.url!, isPtt, t.instance, t.key);
     }
   }
 
-  private async sendDocumentMessage(phone: string, msg: DocumentMessage, apiToken: string) {
+  private async sendDocumentMessage(phone: string, msg: DocumentMessage, t: Target) {
     if (!msg.url && !msg.base64) {
       throw new Error('Document requires "url" or "base64" field');
     }
@@ -286,15 +315,15 @@ export class SequenceController {
         msg.base64,
         'document',
         msg.caption,
-        undefined,
-        apiToken,
+        t.instance,
+        t.key,
       );
     } else {
-      return await this.evolutionService.sendDocument(phone, msg.url!, msg.filename, undefined, apiToken);
+      return await this.evolutionService.sendDocument(phone, msg.url!, msg.filename, t.instance, t.key);
     }
   }
 
-  private async sendLocationMessage(phone: string, msg: LocationMessage, apiToken: string) {
+  private async sendLocationMessage(phone: string, msg: LocationMessage, t: Target) {
     if (msg.latitude === undefined || msg.longitude === undefined) {
       throw new Error('Location requires "latitude" and "longitude"');
     }
@@ -305,20 +334,20 @@ export class SequenceController {
       msg.longitude,
       msg.description,
       msg.description,
-      undefined,
-      apiToken,
+      t.instance,
+      t.key,
     );
   }
 
-  private async sendContactMessage(phone: string, msg: ContactMessage, apiToken: string) {
+  private async sendContactMessage(phone: string, msg: ContactMessage, t: Target) {
     if (!msg.contactName || !msg.contactNumber) {
       throw new Error('Contact requires "contactName" and "contactNumber"');
     }
 
-    return await this.evolutionService.sendContact(phone, msg.contactNumber, msg.contactName, undefined, apiToken);
+    return await this.evolutionService.sendContact(phone, msg.contactNumber, msg.contactName, t.instance, t.key);
   }
 
-  private async sendCatalogMessage(phone: string, msg: CatalogMessage, apiToken: string) {
+  private async sendCatalogMessage(phone: string, msg: CatalogMessage, t: Target) {
     if (!msg.images || msg.images.length === 0) {
       throw new Error('Catalog requires "images" array');
     }
@@ -331,7 +360,7 @@ export class SequenceController {
 
     // Send caption as text before if needed
     if (captionMode === 'text_before' && msg.caption) {
-      await this.evolutionService.sendText(phone, msg.caption, undefined, apiToken);
+      await this.evolutionService.sendText(phone, msg.caption, t.instance, t.key);
       await delay(1000);
     }
 
@@ -347,9 +376,9 @@ export class SequenceController {
       }
 
       if (img.imageUrl) {
-        await this.evolutionService.sendImage(phone, img.imageUrl, caption, undefined, apiToken);
+        await this.evolutionService.sendImage(phone, img.imageUrl, caption, t.instance, t.key);
       } else if (img.imageBase64) {
-        await this.evolutionService.sendMediaBase64(phone, img.imageBase64, 'image', caption, undefined, apiToken);
+        await this.evolutionService.sendMediaBase64(phone, img.imageBase64, 'image', caption, t.instance, t.key);
       }
 
       // Small delay between catalog images

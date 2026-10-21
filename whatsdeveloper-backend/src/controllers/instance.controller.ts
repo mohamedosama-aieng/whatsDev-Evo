@@ -1,8 +1,23 @@
 import { Request, Response } from 'express';
 import { EvolutionService } from '../services/evolution.service';
+import { AuthedRequest } from '../middleware/auth.middleware';
 
 export class InstanceController {
   constructor(private evolutionService: EvolutionService) {}
+
+  /**
+   * Which profile this request is scoped to, and the key to authenticate with.
+   *
+   * Same contract as MessageController.target(): the auth middleware resolved
+   * the caller's token, and these must be forwarded to EvolutionService. Reading
+   * status/chats without them reported the default instance no matter which
+   * token was sent - that is how "both profiles look identical" showed up on the
+   * read endpoints too, not just on send.
+   */
+  private target(req: Request): { instance: string | undefined; key: string | undefined } {
+    const areq = req as AuthedRequest;
+    return { instance: areq.instanceName, key: areq.instanceKey };
+  }
 
   /**
    * @swagger
@@ -16,10 +31,12 @@ export class InstanceController {
    */
   async getStatus(req: Request, res: Response) {
     try {
-      const result = await this.evolutionService.getInstanceStatus();
+      const { instance, key } = this.target(req);
+      const result = await this.evolutionService.getInstanceStatus(instance, key);
 
       return res.json({
         success: true,
+        instance,
         data: result,
       });
     } catch (error: any) {
@@ -42,10 +59,12 @@ export class InstanceController {
    */
   async getChats(req: Request, res: Response) {
     try {
-      const result = await this.evolutionService.getChats();
+      const { instance, key } = this.target(req);
+      const result = await this.evolutionService.getChats(instance, key);
 
       return res.json({
         success: true,
+        instance,
         data: result,
       });
     } catch (error: any) {
@@ -89,10 +108,12 @@ export class InstanceController {
         });
       }
 
-      const result = await this.evolutionService.getChatMessages(phone, limit);
+      const { instance, key } = this.target(req);
+      const result = await this.evolutionService.getChatMessages(phone, limit, instance, key);
 
       return res.json({
         success: true,
+        instance,
         data: result,
       });
     } catch (error: any) {

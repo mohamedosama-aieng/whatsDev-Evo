@@ -82,8 +82,28 @@ function Dashboard() {
       list = list.filter((i) => i.connectionStatus === searchStatus);
     }
     const q = nameSearch.trim().toLowerCase();
-    if (!q) return list;
-    return list.filter((i) => i.name.toLowerCase().includes(q) || (i.profileName && i.profileName.toLowerCase().includes(q)));
+    if (q) {
+      list = list.filter((i) => i.name.toLowerCase().includes(q) || (i.profileName && i.profileName.toLowerCase().includes(q)));
+    }
+
+    // Newest instance first. /instance/fetchInstances returns no meaningful
+    // order at all, so without this the cards appear in whatever order the API
+    // happened to reply with, which changes between refreshes.
+    //
+    // Sorting a COPY is deliberate: when neither filter above ran, `list` is
+    // still the exact array react-query holds in its cache, and
+    // Array.prototype.sort mutates in place - that would reorder cached data
+    // behind react-query's back.
+    //
+    // A missing or unparseable createdAt sorts last rather than returning NaN
+    // from the comparator, which would leave the order undefined for every
+    // pair it touches instead of just that one item.
+    const createdAtMs = (value?: string) => {
+      const parsed = value ? Date.parse(value) : NaN;
+      return Number.isNaN(parsed) ? -Infinity : parsed;
+    };
+
+    return [...list].sort((a, b) => createdAtMs(b.createdAt) - createdAtMs(a.createdAt));
   }, [instances, nameSearch, searchStatus]);
 
   const instanceStatuses = [

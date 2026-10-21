@@ -36,6 +36,11 @@ const createWebhook = async ({ instanceName, token, data }: IParams) => {
       body: JSON.stringify({
         url: data.url,
         enabled: data.enabled !== false,
+        // Both filters are enforced in Backend, not Evolution, because Backend
+        // is what forwards to n8n. Absent means ON, matching the defaults the
+        // endpoint applies.
+        groupMessages: data.groupMessages !== false,
+        fromMeMessages: data.fromMeMessages !== false,
       }),
     });
 

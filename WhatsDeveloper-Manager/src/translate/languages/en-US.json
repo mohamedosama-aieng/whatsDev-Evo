@@ -406,6 +406,14 @@
         "label": "Webhook Base64",
         "description": "Send media base64 data in webhook"
       },
+      "groupMessages": {
+        "label": "Group Messages",
+        "description": "Forward messages coming from groups (@g.us). Turn off to ignore group messages and send only direct chats"
+      },
+      "fromMeMessages": {
+        "label": "Own Messages",
+        "description": "Forward messages sent by this instance (fromMe). Turn off to block outgoing messages and prevent reply loops"
+      },
       "events": {
         "label": "Events"
       }

@@ -8,6 +8,8 @@ import path from 'path';
 import { EvolutionService } from './services/evolution.service';
 import { WebhookService } from './services/webhook.service';
 import { AutoConfigService } from './services/auto-config.service';
+import { DbService } from './services/db.service';
+import { InstanceResolver } from './services/instance-resolver.service';
 import { MessageController } from './controllers/message.controller';
 import { InstanceController } from './controllers/instance.controller';
 import { SequenceController } from './controllers/sequence.controller';
@@ -30,6 +32,18 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
 const AUTO_CONFIGURE_WEBHOOKS = process.env.AUTO_CONFIGURE_WEBHOOKS === 'true';
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || `http://localhost:${PORT}`;
+
+// Shared with Evolution. Used for two things: resolving a caller's token to a
+// WhatsApp profile (Evolution's "Instance" table), and storing our own n8n
+// targets (wd_backend_webhook).
+const DATABASE_CONNECTION_URI = process.env.DATABASE_CONNECTION_URI || '';
+
+// Transition switch. While true, a request with no token (or an unrecognised
+// one) is served from DEFAULT_INSTANCE_NAME and logged as LEGACY. That is how
+// the existing n8n workflows call these endpoints today. It also means anyone
+// who can reach this backend can send WhatsApp messages, so flip it to false
+// once the workflows pass a token.
+const ALLOW_LEGACY_UNAUTHENTICATED = process.env.ALLOW_LEGACY_UNAUTHENTICATED !== 'false';
 
 // Initialize Express app
 const app: Application = express();
@@ -62,6 +76,10 @@ const limiter = rateLimit({
 app.use('/api/', limiter);
 
 // Initialize services
+//
+// One EvolutionService is enough: the global key here is only a fallback. Each
+// call takes an explicit instance + key, which the auth middleware resolves
+// from the caller's token.
 const evolutionService = new EvolutionService({
   baseURL: EVOLUTION_API_URL,
   apiKey: EVOLUTION_API_KEY,
@@ -77,17 +95,19 @@ const sequenceController = new SequenceController(evolutionService);
 const webhookController = new WebhookController(webhookService);
 const testController = new TestController();
 
-// Create auth middleware
-const authMiddleware = createAuthMiddleware((apiKey: string) => {
-  return new EvolutionService({
-    baseURL: EVOLUTION_API_URL,
-    apiKey: apiKey,
-    defaultInstance: DEFAULT_INSTANCE_NAME,
-  });
+const authMiddleware = createAuthMiddleware({
+  allowLegacyUnauthenticated: ALLOW_LEGACY_UNAUTHENTICATED,
 });
 
 // Setup routes
-const router = createRouter(messageController, instanceController, sequenceController, webhookController, testController, authMiddleware);
+const router = createRouter(
+  messageController,
+  instanceController,
+  sequenceController,
+  webhookController,
+  testController,
+  authMiddleware,
+);
 app.use('/', router);
 
 // API Documentation - Serve static HTML
@@ -118,49 +138,112 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
   });
 });
 
-// Start server
-app.listen(PORT, async () => {
-  console.log('╔═══════════════════════════════════════════════════════╗');
-  console.log('║     WhatsDeveloper Backend Bridge API                ║');
-  console.log('╠═══════════════════════════════════════════════════════╣');
-  console.log(`║  🚀 Server running on: http://localhost:${PORT.toString().padEnd(4)} ║`);
-  console.log(`║  📚 API Docs: http://localhost:${PORT}/api-docs          ║`);
-  console.log(`║  🔗 Evolution API: ${EVOLUTION_API_URL.padEnd(29)} ║`);
-  console.log(`║  📱 Instance: ${DEFAULT_INSTANCE_NAME.padEnd(37)} ║`);
-  console.log('╚═══════════════════════════════════════════════════════╝');
-  console.log('');
-
-  // Auto-configure webhooks if enabled
-  if (AUTO_CONFIGURE_WEBHOOKS && N8N_WEBHOOK_URL) {
-    const autoConfig = new AutoConfigService({
-      evolutionApiUrl: EVOLUTION_API_URL,
-      evolutionApiKey: EVOLUTION_API_KEY,
-      instanceName: DEFAULT_INSTANCE_NAME,
-      backendPublicUrl: BACKEND_PUBLIC_URL,
-      n8nWebhookUrl: N8N_WEBHOOK_URL,
-    });
-
-    // Run auto-configuration in background
-    autoConfig.configure().catch((error) => {
-      console.error('Auto-configuration error:', error);
-    });
-  } else {
-    console.log('╔═══════════════════════════════════════════════════════╗');
-    console.log('║  ⚠️  Auto-configuration disabled                      ║');
-    console.log('╠═══════════════════════════════════════════════════════╣');
-    console.log('║  Set AUTO_CONFIGURE_WEBHOOKS=true in .env to enable  ║');
-    console.log('║  Also set N8N_WEBHOOK_URL and BACKEND_PUBLIC_URL     ║');
-    console.log('╚═══════════════════════════════════════════════════════╝');
+/**
+ * Bring up the database and load persisted state.
+ *
+ * Runs before listen() so the first request already has token resolution and
+ * the webhook table available. A failure here is not fatal: the backend still
+ * serves, but token->instance resolution is impossible, so sends fall back to
+ * the default profile. That is loud in the logs on purpose.
+ */
+async function initPersistence(): Promise<boolean> {
+  if (!DATABASE_CONNECTION_URI) {
+    console.warn('╔═══════════════════════════════════════════════════════╗');
+    console.warn('║  ⚠️  DATABASE_CONNECTION_URI is not set               ║');
+    console.warn('║  Per-instance API keys cannot be resolved, and n8n    ║');
+    console.warn('║  targets will not persist across a restart.           ║');
+    console.warn('╚═══════════════════════════════════════════════════════╝');
+    return false;
   }
+
+  try {
+    await DbService.getInstance().init(DATABASE_CONNECTION_URI);
+    return true;
+  } catch (error: any) {
+    console.error('╔═══════════════════════════════════════════════════════╗');
+    console.error('║  ⚠️  Database connection failed                       ║');
+    console.error(`║  ${String(error.message).substring(0, 51).padEnd(51)} ║`);
+    console.error('║  Running degraded: sends fall back to the default     ║');
+    console.error('║  profile and webhook changes are memory-only.         ║');
+    console.error('╚═══════════════════════════════════════════════════════╝');
+    return false;
+  }
+}
+
+async function bootstrap() {
+  const dbOk = await initPersistence();
+
+  // Resolver needs the global key to tell "full access" from a per-instance
+  // token, and the default instance for the legacy fallback.
+  InstanceResolver.getInstance().configure(EVOLUTION_API_KEY, DEFAULT_INSTANCE_NAME);
+
+  // Loads the webhook table into cache and imports any legacy .webhooks.json.
+  await webhookService.init();
+
+  app.listen(PORT, async () => {
+    console.log('╔═══════════════════════════════════════════════════════╗');
+    console.log('║     WhatsDeveloper Backend Bridge API                ║');
+    console.log('╠═══════════════════════════════════════════════════════╣');
+    console.log(`║  🚀 Server running on: http://localhost:${PORT.toString().padEnd(4)} ║`);
+    console.log(`║  📚 API Docs: http://localhost:${PORT}/api-docs          ║`);
+    console.log(`║  🔗 Evolution API: ${EVOLUTION_API_URL.padEnd(29)} ║`);
+    console.log(`║  📱 Default instance: ${DEFAULT_INSTANCE_NAME.padEnd(29)} ║`);
+    console.log(`║  🗄️  Database: ${(dbOk ? 'connected' : 'DEGRADED').padEnd(36)} ║`);
+    console.log('╚═══════════════════════════════════════════════════════╝');
+    console.log('');
+
+    if (ALLOW_LEGACY_UNAUTHENTICATED) {
+      console.warn('╔═══════════════════════════════════════════════════════╗');
+      console.warn('║  ⚠️  ALLOW_LEGACY_UNAUTHENTICATED is ON               ║');
+      console.warn('║  Requests without a valid token are accepted and      ║');
+      console.warn('║  served from the default profile. Anyone who can      ║');
+      console.warn('║  reach this port can send WhatsApp messages.          ║');
+      console.warn('║  Set ALLOW_LEGACY_UNAUTHENTICATED=false when the n8n  ║');
+      console.warn('║  workflows send X-API-Token.                          ║');
+      console.warn('╚═══════════════════════════════════════════════════════╝');
+      console.warn('');
+    }
+
+    // Re-assert the webhook wiring for every instance. Evolution's webhook row
+    // cascades away with its instance row, so this is what makes a lost
+    // configuration come back by itself after a restart.
+    if (AUTO_CONFIGURE_WEBHOOKS) {
+      const autoConfig = new AutoConfigService({
+        evolutionApiUrl: EVOLUTION_API_URL,
+        evolutionApiKey: EVOLUTION_API_KEY,
+        instanceName: DEFAULT_INSTANCE_NAME,
+        backendPublicUrl: BACKEND_PUBLIC_URL,
+        n8nWebhookUrl: N8N_WEBHOOK_URL,
+      });
+
+      autoConfig.configure().catch((error) => {
+        console.error('Auto-configuration error:', error);
+      });
+    } else {
+      console.log('╔═══════════════════════════════════════════════════════╗');
+      console.log('║  ⚠️  Auto-configuration disabled                      ║');
+      console.log('║  Set AUTO_CONFIGURE_WEBHOOKS=true to re-assert the    ║');
+      console.log('║  Evolution → Backend wiring on every start.           ║');
+      console.log('╚═══════════════════════════════════════════════════════╝');
+    }
+  });
+}
+
+bootstrap().catch((error) => {
+  console.error('Fatal startup error:', error);
+  process.exit(1);
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
+async function shutdown(signal: string) {
+  console.log(`${signal} received, shutting down gracefully...`);
+  try {
+    await DbService.getInstance().close();
+  } catch {
+    // already closed or never opened
+  }
   process.exit(0);
-});
+}
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  process.exit(0);
-});
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));

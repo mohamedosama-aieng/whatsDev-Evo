@@ -1,8 +1,23 @@
 import { Request, Response } from 'express';
 import { EvolutionService } from '../services/evolution.service';
+import { AuthedRequest } from '../middleware/auth.middleware';
 
 export class MessageController {
   constructor(private evolutionService: EvolutionService) {}
+
+  /**
+   * Which profile to send as, and the key to authenticate with.
+   *
+   * Set by the auth middleware from the caller's token. Every send below must
+   * pass both to EvolutionService; omitting them is what made two profiles both
+   * send from DEFAULT_INSTANCE_NAME. The service's own `instanceName ||
+   * this.defaultInstance` fallback hides the mistake, so it will not surface as
+   * an error - only as messages leaving the wrong account.
+   */
+  private target(req: Request): { instance: string | undefined; key: string | undefined } {
+    const areq = req as AuthedRequest;
+    return { instance: areq.instanceName, key: areq.instanceKey };
+  }
 
   /**
    * @swagger
@@ -43,6 +58,8 @@ export class MessageController {
         });
       }
 
+      const { instance, key } = this.target(req);
+
       // ✅ Respond immediately to n8n
       res.json({
         success: true,
@@ -51,12 +68,15 @@ export class MessageController {
         data: {
           phone,
           type: 'text',
+          // Echo the resolved profile: the send happens after this response, so
+          // this is the only way a caller can tell which account was used.
+          instance,
         },
       });
 
       // 🚀 Send message in background (don't await)
-      this.evolutionService.sendText(phone, message).catch((error) => {
-        console.error('[sendMessage] Background send failed:', error.message);
+      this.evolutionService.sendText(phone, message, instance, key).catch((error) => {
+        console.error(`[sendMessage] Background send failed (instance=${instance}):`, error.message);
       });
 
     } catch (error: any) {
@@ -108,6 +128,7 @@ export class MessageController {
       const phone = req.body.phone || req.body.to;
       const image = req.body.image || req.body.imageUrl;
       const caption = req.body.caption;
+      const { instance, key } = this.target(req);
 
       if (!phone || !image) {
         return res.status(400).json({
@@ -129,7 +150,7 @@ export class MessageController {
       });
 
       // 🚀 Send image in background
-      this.evolutionService.sendImage(phone, image, caption).catch((error) => {
+      this.evolutionService.sendImage(phone, image, caption, instance, key).catch((error) => {
         console.error('[sendImage] Background send failed:', error.message);
       });
 
@@ -173,6 +194,7 @@ export class MessageController {
       const phone = req.body.phone || req.body.to;
       const video = req.body.video || req.body.videoUrl;
       const caption = req.body.caption;
+      const { instance, key } = this.target(req);
 
       if (!phone || !video) {
         return res.status(400).json({
@@ -194,7 +216,7 @@ export class MessageController {
       });
 
       // 🚀 Send video in background
-      this.evolutionService.sendVideo(phone, video, caption).catch((error) => {
+      this.evolutionService.sendVideo(phone, video, caption, instance, key).catch((error) => {
         console.error('[sendVideo] Background send failed:', error.message);
       });
 
@@ -236,6 +258,7 @@ export class MessageController {
       const phone = req.body.phone || req.body.to;
       const audio = req.body.audio || req.body.audioUrl;
       const ptt = req.body.ptt; // PTT support for voice messages
+      const { instance, key } = this.target(req);
 
       if (!phone || !audio) {
         return res.status(400).json({
@@ -258,7 +281,7 @@ export class MessageController {
       });
 
       // 🚀 Send audio in background
-      this.evolutionService.sendAudio(phone, audio, ptt).catch((error) => {
+      this.evolutionService.sendAudio(phone, audio, ptt, instance, key).catch((error) => {
         console.error('[sendAudio] Background send failed:', error.message);
       });
 
@@ -302,6 +325,7 @@ export class MessageController {
       const phone = req.body.phone || req.body.to;
       const document = req.body.document || req.body.documentUrl;
       const fileName = req.body.fileName || req.body.filename;
+      const { instance, key } = this.target(req);
 
       if (!phone || !document) {
         return res.status(400).json({
@@ -324,7 +348,7 @@ export class MessageController {
       });
 
       // 🚀 Send document in background
-      this.evolutionService.sendDocument(phone, document, fileName).catch((error) => {
+      this.evolutionService.sendDocument(phone, document, fileName, instance, key).catch((error) => {
         console.error('[sendDocument] Background send failed:', error.message);
       });
 
@@ -378,7 +402,16 @@ export class MessageController {
         });
       }
 
-      const result = await this.evolutionService.sendLocation(phone, latitude, longitude, name, address);
+      const { instance, key } = this.target(req);
+      const result = await this.evolutionService.sendLocation(
+        phone,
+        latitude,
+        longitude,
+        name,
+        address,
+        instance,
+        key,
+      );
 
       return res.json({
         success: true,
@@ -430,7 +463,8 @@ export class MessageController {
         });
       }
 
-      const result = await this.evolutionService.sendContact(phone, contactPhone, contactName);
+      const { instance, key } = this.target(req);
+      const result = await this.evolutionService.sendContact(phone, contactPhone, contactName, instance, key);
 
       return res.json({
         success: true,
@@ -487,7 +521,8 @@ export class MessageController {
         });
       }
 
-      const result = await this.evolutionService.sendButtons(phone, title, description, buttons);
+      const { instance, key } = this.target(req);
+      const result = await this.evolutionService.sendButtons(phone, title, description, buttons, instance, key);
 
       return res.json({
         success: true,

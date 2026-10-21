@@ -159,6 +159,7 @@ import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
   remoteJidAlt?: string;
+  remoteJidLid?: string;
   participantAlt?: string;
   server_id?: string;
   isViewOnce?: boolean;
@@ -1543,8 +1544,28 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
-            messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+
+          // WhatsApp may address a contact with a Local Identifier (@lid)
+          // instead of the public phone JID. Resolve it before the webhook is
+          // emitted, but keep the original LID for consumers that need to
+          // reply through Baileys when no phone mapping is available.
+          if (messageRaw.key.remoteJid?.includes('@lid')) {
+            const lidJid = messageRaw.key.remoteJid;
+            let phoneJid = messageRaw.key.remoteJidAlt;
+
+            if (!phoneJid) {
+              try {
+                phoneJid = await this.client.signalRepository.lidMapping.getPNForLID(lidJid);
+              } catch (error) {
+                this.logger.warn(`Unable to resolve WhatsApp LID ${lidJid}: ${error?.message || error}`);
+              }
+            }
+
+            messageRaw.key.remoteJidLid = lidJid;
+            if (phoneJid && !phoneJid.includes('@lid')) {
+              messageRaw.key.remoteJidAlt = phoneJid;
+              messageRaw.key.remoteJid = phoneJid;
+            }
           }
 
           // Add mediaUrl to root level for webhook if it exists in message

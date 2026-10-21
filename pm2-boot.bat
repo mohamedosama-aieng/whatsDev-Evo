@@ -2,8 +2,8 @@
 REM Boot hook for the dk.whatsdeveloper.com stack (F:\whatsDev-Evo).
 REM Registered as the Scheduled Task "dkevo-pm2-boot", runs at system startup.
 REM
-REM Scope note: this starts ONLY this project's ecosystem, not every app in the
-REM shared pm2 dump. Other projects on this box are deliberately left alone.
+REM Scope note: restore the complete shared PM2 dump. The dump is the source
+REM of truth for all projects on this machine.
 REM
 REM Manual use:  pm2-boot.bat
 REM Remove task: schtasks /delete /tn "dkevo-pm2-boot" /f
@@ -36,11 +36,12 @@ ping -n 21 127.0.0.1 >nul 2>&1
 
 echo [%date% %time%] --- pm2-boot start (PM2_HOME=%PM2_HOME%) --- >> "%LOG%"
 
-REM startOrReload, not start: starts what is down, reloads what is already
-REM up. Safe to run twice, so a manual run never errors with
-REM "Script already launched".
-call "%PM2%" startOrReload "F:\whatsDev-Evo\ecosystem.config.js" >> "%LOG%" 2>&1
-call "%PM2%" save >> "%LOG%" 2>&1
+REM Restore every process saved by `pm2 save`.
+REM Do not run `pm2 save` here: saving an incomplete runtime list would
+REM overwrite dump.pm2 and permanently discard the other projects.
+call "%PM2%" resurrect >> "%LOG%" 2>&1
+set "PM2_EXIT=%ERRORLEVEL%"
+echo [%date% %time%] pm2 resurrect exit code: %PM2_EXIT% >> "%LOG%"
 
 echo [%date% %time%] --- pm2-boot done --- >> "%LOG%"
-exit /b 0
+exit /b %PM2_EXIT%

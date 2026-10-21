@@ -922,6 +922,27 @@ Delivery tracking, analytics dashboards
   "device\_id": 1
 }
 
+### WhatsApp `@lid` contacts
+
+WhatsApp sometimes sends a contact as a Local Identifier instead of a phone JID.
+An `@lid` value is **not a phone number** and must not be converted by simply
+removing `@lid`.
+
+The webhook bridge resolves `key.remoteJidAlt` (or Baileys' LID mapping) before
+forwarding the event. Use these fields in n8n:
+
+| Field | Meaning |
+| --- | --- |
+| `data.from` | Phone number without suffix when resolved; otherwise the full `@lid` JID |
+| `data.fromPhone` | Resolved phone number, or an empty string when no mapping is available |
+| `data.replyTo` | Safe recipient for the send endpoint: phone JID when resolved, full `@lid` JID otherwise |
+| `data.fromJid` | Full resolved sender JID, or the original `@lid` JID |
+| `data.fromLid` | Original `@lid` value when the event used LID addressing |
+
+For replies, send `data.replyTo` to `POST /api/send-message` (or the equivalent
+n8n send node). The Evolution API accepts a full `@lid` JID, so a reply does not
+need to wait for a phone-number mapping.
+
 Labels Management Use Cases
 ---------------------------
 

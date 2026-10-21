@@ -63,13 +63,13 @@
         "closed": "Fechada"
       },
       "timeOptions": {
-        "all": "Qualquer momento",
         "5": "Últimos 5 minutos",
         "10": "Últimos 10 minutos",
         "15": "Últimos 15 minutos",
         "20": "Últimos 20 minutos",
         "30": "Últimos 30 minutos",
         "60": "Últimos 60 minutos",
+        "all": "Qualquer momento",
         ">60": "Mais de 60 minutos",
         ">120": "Mais de 2 horas",
         ">300": "Mais de 5 horas",
@@ -363,8 +363,20 @@
         "label": "Webhook Base64",
         "description": "Enviar dados de mídia em base64 no webhook"
       },
+      "groupMessages": {
+        "label": "Mensagens de Grupo",
+        "description": "Encaminhar mensagens vindas de grupos (@g.us). Desative para ignorar mensagens de grupo e enviar apenas conversas diretas"
+      },
+      "fromMeMessages": {
+        "label": "Mensagens Próprias",
+        "description": "Encaminhar mensagens enviadas por esta instância (fromMe). Desative para bloquear mensagens enviadas e prevenir loops de resposta"
+      },
       "events": {
         "label": "Eventos"
+      },
+      "fromMeMessages": {
+        "label": "Mensagens Próprias",
+        "description": "Encaminhar mensagens enviadas por esta instância (fromMe). Desative para bloquear mensagens enviadas e prevenir loops de resposta"
       }
     },
     "button": {

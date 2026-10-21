@@ -28,13 +28,13 @@ module.exports = {
     },
     {
       // Evolution API. Listens on 2345 (SERVER_PORT in its .env).
-      // It ships TypeScript only (no dist), and package.json start is
-      // "tsx ./src/main.ts", so run the tsx CLI directly. Calling the .cmd
-      // shim through pm2 on Windows is unreliable, so point at cli.mjs.
+      // Invoke node.exe as the binary. PM2 cannot spawn the tsx .cmd shim on
+      // Windows, while this is the same command used by `npm start`.
       name: 'dkevo-evolution',
-      script: './node_modules/tsx/dist/cli.mjs',
-      args: './src/main.ts',
+      script: 'C:/Program Files/nodejs/node.exe',
+      args: '--env-file=.env ./node_modules/tsx/dist/cli.mjs ./src/main.ts',
       cwd: 'F:/whatsDev-Evo/evolution-api',
+      interpreter: 'none',
       watch: false,
       autorestart: true,
       // Baileys holds WhatsApp sockets and media buffers; give it more room.

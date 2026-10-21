@@ -339,6 +339,25 @@ export type Webhook = {
   events: string[];
   base64: boolean;
   byEvents: boolean;
+  /**
+   * Forward messages coming from WhatsApp groups (JID ending @g.us).
+   *
+   * Enforced by the Backend on the hop to n8n, not by Evolution - Evolution has
+   * no equivalent column. Optional so the direct-to-Evolution fallback path,
+   * which cannot honour it, still type-checks.
+   */
+  groupMessages?: boolean;
+  /**
+   * Forward messages the instance itself sent (key.fromMe === true).
+   *
+   * Enforced by the Backend on the hop to n8n, not by Evolution. Turning this
+   * off stops MESSAGES_UPSERT from delivering outgoing messages, which breaks
+   * reply loops at the source without needing a fromMe guard in every n8n flow.
+   *
+   * Optional for the same reason as groupMessages: the fallback path through
+   * Evolution cannot enforce it and has no such field.
+   */
+  fromMeMessages?: boolean;
 };
 
 export type Websocket = {
