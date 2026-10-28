@@ -90,6 +90,53 @@ export interface WebhookPayload {
       forwardingScore: number;
       detectionReason: string[];
       extractedUrls?: string[];
+      sourceUrl?: string;
+      title?: string;
+      caption?: string;
+      postCaption?: string;
+      body?: string;
+      thumbnailUrl?: string;
+      mediaType?: string;
+      adSource?: string;
+      conversionSource?: string;
+      conversionData?: any;
+      sourceId?: string;
+      ctwaClid?: string;
+      showAdAttribution?: boolean;
+      sourceApp?: string;
+      entryPointConversionSource?: string;
+      entryPointConversionApp?: string;
+      entryPointConversionExternalSource?: string;
+      conversionDelaySeconds?: number;
+      mediaUrl?: string;
+      originalImageUrl?: string;
+      greetingMessageBody?: string;
+    };
+    /** Normalized Click-to-WhatsApp/Facebook ad context for n8n routing. */
+    isAdvertisement?: boolean;
+    advertisement?: {
+      sourceUrl?: string;
+      displayText?: string;
+      title?: string;
+      caption?: string;
+      postCaption?: string;
+      body?: string;
+      thumbnailUrl?: string;
+      mediaType?: string;
+      adSource?: string;
+      conversionSource?: string;
+      conversionData?: any;
+      sourceId?: string;
+      ctwaClid?: string;
+      showAdAttribution?: boolean;
+      sourceApp?: string;
+      entryPointConversionSource?: string;
+      entryPointConversionApp?: string;
+      entryPointConversionExternalSource?: string;
+      conversionDelaySeconds?: number;
+      mediaUrl?: string;
+      originalImageUrl?: string;
+      greetingMessageBody?: string;
     };
   };
 }
@@ -441,11 +488,15 @@ export class WebhookService {
       },
     };
 
-    // Detect if message is an ad
-    const adDetection = this.detectAd(message);
+    // Evolution's prepareMessage keeps contextInfo beside `message` after it
+    // flattens extendedTextMessage into conversation. Ad metadata therefore
+    // cannot be read reliably from `message` alone.
+    const adDetection = this.detectAd(message, evolutionMessage);
     if (adDetection.isAd) {
       payload.data.isAd = true;
       payload.data.adMetadata = adDetection.metadata;
+      payload.data.isAdvertisement = true;
+      payload.data.advertisement = adDetection.advertisement;
     }
 
     // Extract message content based on type
@@ -566,17 +617,147 @@ export class WebhookService {
   /**
    * Detect if message is a Facebook Ad
    */
-  private detectAd(message: any): { isAd: boolean; metadata?: any } {
+  private detectAd(message: any, evolutionMessage: any = {}): { isAd: boolean; metadata?: any; advertisement?: any } {
     const reasons: string[] = [];
     let isForwarded = false;
     let forwardingScore = 0;
     const extractedUrls: string[] = [];
 
     // Get message text
-    const text = message.conversation || message.extendedTextMessage?.text || message.imageMessage?.caption || '';
+    const text =
+      message.conversation ||
+      message.extendedTextMessage?.text ||
+      message.imageMessage?.caption ||
+      message.videoMessage?.caption ||
+      '';
 
-    // Get contextInfo
-    const contextInfo = message.extendedTextMessage?.contextInfo || message.imageMessage?.contextInfo || {};
+    // Depending on the Baileys/Evolution version, ad metadata can be inside
+    // the content node or on the prepared message itself.
+    const nestedMessage =
+      message.ephemeralMessage?.message ||
+      message.viewOnceMessage?.message ||
+      message.viewOnceMessageV2?.message ||
+      message.documentWithCaptionMessage?.message ||
+      {};
+    const contextInfo =
+      evolutionMessage.contextInfo ||
+      message.contextInfo ||
+      evolutionMessage.messageContextInfo ||
+      message.messageContextInfo ||
+      message.extendedTextMessage?.contextInfo ||
+      message.imageMessage?.contextInfo ||
+      message.videoMessage?.contextInfo ||
+      nestedMessage.messageContextInfo ||
+      nestedMessage.extendedTextMessage?.contextInfo ||
+      nestedMessage.imageMessage?.contextInfo ||
+      nestedMessage.videoMessage?.contextInfo ||
+      {};
+    const ctwaContext =
+      evolutionMessage.ctwaContext ||
+      message.ctwaContext ||
+      nestedMessage.ctwaContext ||
+      contextInfo.ctwaContext ||
+      null;
+    const referral =
+      evolutionMessage.referral ||
+      message.referral ||
+      nestedMessage.referral ||
+      contextInfo.referral ||
+      contextInfo.externalAdReply ||
+      contextInfo.adReply ||
+      null;
+    const referralSourceUrl = referral?.sourceUrl || referral?.url || '';
+    const sourceUrl = ctwaContext?.sourceUrl || referralSourceUrl || '';
+    const sourceApp =
+      ctwaContext?.sourceApp ||
+      referral?.sourceApp ||
+      evolutionMessage.entryPointConversionApp ||
+      contextInfo.entryPointConversionApp ||
+      undefined;
+    const entryPointConversionSource =
+      evolutionMessage.entryPointConversionSource ||
+      contextInfo.entryPointConversionSource ||
+      undefined;
+    const entryPointConversionApp =
+      evolutionMessage.entryPointConversionApp ||
+      contextInfo.entryPointConversionApp ||
+      undefined;
+    const entryPointConversionExternalSource =
+      evolutionMessage.entryPointConversionExternalSource ||
+      contextInfo.entryPointConversionExternalSource ||
+      undefined;
+    const conversionSource =
+      ctwaContext?.conversionSource ||
+      referral?.conversionSource ||
+      evolutionMessage.conversionSource ||
+      contextInfo.conversionSource ||
+      undefined;
+    const conversionData =
+      ctwaContext?.conversionData ||
+      referral?.conversionData ||
+      evolutionMessage.conversionData ||
+      contextInfo.conversionData ||
+      undefined;
+    const isCtwaEntryPoint = entryPointConversionSource === 'ctwa_ad' || entryPointConversionSource === 'post_cta';
+    const isFacebookUrl = (value: unknown): boolean => {
+      if (typeof value !== 'string') return false;
+      try {
+        const hostname = new URL(value).hostname.toLowerCase();
+        return (
+          hostname === 'fb.me' ||
+          hostname.endsWith('.facebook.com') ||
+          hostname === 'facebook.com' ||
+          hostname.endsWith('.instagram.com') ||
+          hostname === 'instagram.com'
+        );
+      } catch {
+        return false;
+      }
+    };
+    const hasFacebookReferral = Boolean(referral && isFacebookUrl(sourceUrl));
+    const hasAdContext = Boolean(
+      ctwaContext ||
+      evolutionMessage.referral ||
+      message.referral ||
+      contextInfo.adReply ||
+      sourceApp ||
+      isCtwaEntryPoint ||
+      conversionSource === 'FB_Ads' ||
+      conversionSource === 'FB_Post' ||
+      (referral && (referral.showAdAttribution || referral.sourceType || referral.ctwaClid || hasFacebookReferral)),
+    );
+    const adCaption =
+      ctwaContext?.displayText ||
+      ctwaContext?.adBody ||
+      referral?.displayText ||
+      referral?.body ||
+      referral?.description ||
+      '';
+    const adTitle = ctwaContext?.title || ctwaContext?.headline || referral?.title || referral?.headline || '';
+    const advertisement = {
+      sourceUrl: sourceUrl || undefined,
+      displayText: ctwaContext?.displayText || referral?.displayText || adCaption || undefined,
+      title: adTitle || undefined,
+      caption: adCaption || undefined,
+      postCaption: adCaption || undefined,
+      body: referral?.body || ctwaContext?.adBody || undefined,
+      thumbnailUrl: ctwaContext?.thumbnailUrl || referral?.thumbnailUrl || undefined,
+      mediaType: ctwaContext?.mediaType || referral?.mediaType || undefined,
+      adSource: sourceApp === 'instagram' ? 'instagram' : ctwaContext ? 'ctwaContext' : hasFacebookReferral ? 'referral' : undefined,
+      conversionSource,
+      conversionData,
+      sourceId: ctwaContext?.sourceId || referral?.sourceId || undefined,
+      ctwaClid: ctwaContext?.ctwaClid || referral?.ctwaClid || undefined,
+      showAdAttribution: referral?.showAdAttribution || undefined,
+      sourceApp,
+      entryPointConversionSource,
+      entryPointConversionApp,
+      entryPointConversionExternalSource,
+      conversionDelaySeconds: evolutionMessage.conversionDelaySeconds || contextInfo.conversionDelaySeconds || undefined,
+      mediaUrl: referral?.mediaUrl || undefined,
+      originalImageUrl: referral?.originalImageUrl || undefined,
+      greetingMessageBody: referral?.greetingMessageBody || undefined,
+    };
 
     // Check 1: Is Forwarded
     if (contextInfo.isForwarded === true) {
@@ -637,6 +818,12 @@ export class WebhookService {
     }
 
     // Determine if it's an ad
+    // CTWA/referral metadata is the authoritative signal. A Facebook URL in
+    // an external ad reply is also enough; ordinary non-Facebook link previews
+    // must not be mislabeled as ads.
+    if (hasAdContext) reasons.push('ctwa_context');
+    if (hasFacebookReferral) reasons.push('facebook_referral');
+
     const isAd = reasons.length > 0 || (isForwarded && forwardingScore > 0);
 
     if (!isAd) {
@@ -650,7 +837,29 @@ export class WebhookService {
         forwardingScore,
         detectionReason: reasons,
         extractedUrls: extractedUrls.length > 0 ? extractedUrls : undefined,
+        sourceUrl: advertisement.sourceUrl,
+        title: advertisement.title,
+        caption: advertisement.caption,
+        postCaption: advertisement.postCaption,
+        body: advertisement.body,
+        thumbnailUrl: advertisement.thumbnailUrl,
+        mediaType: advertisement.mediaType,
+        adSource: advertisement.adSource,
+        conversionSource: advertisement.conversionSource,
+        conversionData: advertisement.conversionData,
+        sourceId: advertisement.sourceId,
+        ctwaClid: advertisement.ctwaClid,
+        showAdAttribution: advertisement.showAdAttribution,
+        sourceApp: advertisement.sourceApp,
+        entryPointConversionSource: advertisement.entryPointConversionSource,
+        entryPointConversionApp: advertisement.entryPointConversionApp,
+        entryPointConversionExternalSource: advertisement.entryPointConversionExternalSource,
+        conversionDelaySeconds: advertisement.conversionDelaySeconds,
+        mediaUrl: advertisement.mediaUrl,
+        originalImageUrl: advertisement.originalImageUrl,
+        greetingMessageBody: advertisement.greetingMessageBody,
       },
+      advertisement,
     };
   }
 }

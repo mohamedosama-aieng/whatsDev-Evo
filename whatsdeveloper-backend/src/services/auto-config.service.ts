@@ -94,11 +94,18 @@ export class AutoConfigService {
   private async targetInstances(): Promise<string[]> {
     const db = DbService.getInstance();
 
+    // Read both sources and merge them. The DB only contains instances that
+    // have already been persisted by the Manager, while Evolution also knows
+    // about profiles created/imported outside the Manager. Returning early from
+    // either source left those profiles without the shared webhook bridge.
+    const names = new Set<string>();
+
     if (db.isReady()) {
       try {
         const rows = await db.listConnectedInstances();
-        if (rows.length > 0) return rows.map((r) => r.name);
-        console.log('║  ⚠️  No connected instances in DB                     ║');
+        for (const row of rows) {
+          if (row.name) names.add(row.name);
+        }
       } catch (error: any) {
         console.log(`║  ⚠️  DB instance list failed: ${String(error.message).substring(0, 21).padEnd(21)} ║`);
       }
@@ -109,16 +116,21 @@ export class AutoConfigService {
         headers: { apikey: this.options.evolutionApiKey },
         timeout: 8000,
       });
-      const list = Array.isArray(res.data) ? res.data : [];
-      const names = list
-        .map((i: any) => i?.name ?? i?.instance?.instanceName)
-        .filter((n: any): n is string => typeof n === 'string' && n.length > 0);
-      if (names.length > 0) return names;
-    } catch {
-      // fall through to the default below
+      const list = Array.isArray(res.data)
+        ? res.data
+        : Array.isArray(res.data?.instances)
+          ? res.data.instances
+          : [];
+      for (const instance of list) {
+        const name = instance?.name ?? instance?.instance?.instanceName;
+        if (typeof name === 'string' && name.length > 0) names.add(name);
+      }
+    } catch (error: any) {
+      console.log(`║  ⚠️  Evolution instance list failed: ${String(error.message).substring(0, 18).padEnd(18)} ║`);
     }
 
-    return this.options.instanceName ? [this.options.instanceName] : [];
+    if (this.options.instanceName) names.add(this.options.instanceName);
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
   }
 
   private async waitForEvolution(): Promise<void> {
