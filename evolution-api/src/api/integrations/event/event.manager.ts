@@ -125,11 +125,13 @@ export class EventManager {
     integration?: string[];
     extra?: Record<string, any>;
   }): Promise<void> {
+    // Keep automation webhooks ahead of optional transports so a slow event
+    // integration cannot delay delivery to the configured message workflow.
+    await this.webhook.emit(eventData);
     await this.websocket.emit(eventData);
     await this.rabbitmq.emit(eventData);
     await this.nats.emit(eventData);
     await this.sqs.emit(eventData);
-    await this.webhook.emit(eventData);
     await this.pusher.emit(eventData);
     await this.kafka.emit(eventData);
   }

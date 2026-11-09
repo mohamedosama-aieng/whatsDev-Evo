@@ -1178,6 +1178,45 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
+          const messageRaw = this.prepareMessage(received);
+
+          // Resolve the sender before dispatching the early webhook so LID
+          // contacts retain the same reply fields as the normal message path.
+          if (messageRaw.key.remoteJid?.includes('@lid')) {
+            const lidJid = messageRaw.key.remoteJid;
+            let phoneJid = messageRaw.key.remoteJidAlt;
+
+            if (!phoneJid) {
+              try {
+                phoneJid = await this.client.signalRepository.lidMapping.getPNForLID(lidJid);
+              } catch (error) {
+                this.logger.warn(`Unable to resolve WhatsApp LID ${lidJid}: ${error?.message || error}`);
+              }
+            }
+
+            messageRaw.key.remoteJidLid = lidJid;
+            if (phoneJid && !phoneJid.includes('@lid')) {
+              messageRaw.key.remoteJidAlt = phoneJid;
+              messageRaw.key.remoteJid = phoneJid;
+            }
+          }
+
+          const hasMediaPayload = Boolean(
+            received?.message?.imageMessage ||
+              received?.message?.videoMessage ||
+              received?.message?.stickerMessage ||
+              received?.message?.documentMessage ||
+              received?.message?.documentWithCaptionMessage ||
+              received?.message?.ptvMessage ||
+              received?.message?.audioMessage,
+          );
+
+          // Text messages (including click-to-chat ad messages) do not need
+          // media enrichment. Send them before database and contact lookups.
+          if (!hasMediaPayload) {
+            this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+          }
+
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: received.key.remoteJid },
             select: { id: true, name: true },
@@ -1203,8 +1242,6 @@ export class BaileysStartupService extends ChannelStartupService {
               }
             }
           }
-
-          const messageRaw = this.prepareMessage(received);
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = messageRaw.message.pollUpdateMessage.pollCreationMessageKey;
@@ -1545,27 +1582,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
 
-          // WhatsApp may address a contact with a Local Identifier (@lid)
-          // instead of the public phone JID. Resolve it before the webhook is
-          // emitted, but keep the original LID for consumers that need to
-          // reply through Baileys when no phone mapping is available.
-          if (messageRaw.key.remoteJid?.includes('@lid')) {
-            const lidJid = messageRaw.key.remoteJid;
-            let phoneJid = messageRaw.key.remoteJidAlt;
-
-            if (!phoneJid) {
-              try {
-                phoneJid = await this.client.signalRepository.lidMapping.getPNForLID(lidJid);
-              } catch (error) {
-                this.logger.warn(`Unable to resolve WhatsApp LID ${lidJid}: ${error?.message || error}`);
-              }
-            }
-
-            messageRaw.key.remoteJidLid = lidJid;
-            if (phoneJid && !phoneJid.includes('@lid')) {
-              messageRaw.key.remoteJidAlt = phoneJid;
-              messageRaw.key.remoteJid = phoneJid;
-            }
+          // Deliver the inbound event before the optional persistence/media
+          // work below. Media downloads, profile lookups, Chatwoot and database
+          // writes can take several seconds or time out; none of them should
+          // hold the n8n webhook hostage. The later processing may enrich the
+          // stored message, but the automation gets the message immediately.
+          if (hasMediaPayload) {
+            this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
           }
 
           // Add mediaUrl to root level for webhook if it exists in message
@@ -1582,8 +1605,6 @@ export class BaileysStartupService extends ChannelStartupService {
             messageMediaUrl: messageRaw.message?.mediaUrl,
             rootMediaUrl: messageRaw.mediaUrl,
           }));
-
-          this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },

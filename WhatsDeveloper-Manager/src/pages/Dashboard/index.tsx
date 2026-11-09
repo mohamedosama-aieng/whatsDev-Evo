@@ -34,7 +34,7 @@ function Dashboard() {
   const [searchStatus, setSearchStatus] = useState("all");
 
   const { deleteInstance, logout } = useManageInstance();
-  const { data: instances, isLoading, refetch } = useFetchInstances();
+  const { data: instances, isLoading, isError, error, refetch } = useFetchInstances();
 
   const resetTable = async () => {
     await refetch();
@@ -168,6 +168,22 @@ function Dashboard() {
             {Array.from({ length: 6 }).map((_, i) => (
               <Skeleton key={i} className="h-56 rounded-lg" />
             ))}
+          </div>
+        ) : isError ? (
+          <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-sidebar-border p-8 text-center">
+            <Layers className="h-10 w-10 text-muted-foreground" />
+            <div>
+              <h3 className="text-lg font-semibold">
+                {t("dashboard.loadError.title", { defaultValue: "Não foi possível carregar as instâncias" })}
+              </h3>
+              <p className="mt-1 max-w-xl text-sm text-muted-foreground">
+                {error instanceof Error ? error.message : t("dashboard.loadError.description", { defaultValue: "Verifique a conexão com o servidor e tente novamente." })}
+              </p>
+            </div>
+            <Button onClick={() => refetch()} className="mt-2">
+              <RefreshCw className="mr-2 h-4 w-4" />
+              {t("button.refresh", { defaultValue: "Tentar novamente" })}
+            </Button>
           </div>
         ) : totalCount === 0 ? (
           <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-sidebar-border p-8 text-center">

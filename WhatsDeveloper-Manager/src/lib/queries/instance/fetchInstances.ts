@@ -9,8 +9,18 @@ import { FetchInstancesResponse } from "./types";
 const queryKey = ["instance", "fetchInstances"];
 
 export const fetchInstances = async () => {
-  const response = await apiGlobal.get(`/instance/fetchInstances`);
-  return response.data;
+  try {
+    const response = await apiGlobal.get(`/instance/fetchInstances`, { timeout: 10000 });
+    return response.data;
+  } catch (error) {
+    const fallbackUrl = import.meta.env.VITE_EVOLUTION_API_URL?.replace(/\/$/, "");
+    const configuredUrl = localStorage.getItem("apiUrl")?.replace(/\/$/, "");
+
+    if (!fallbackUrl || fallbackUrl === configuredUrl) throw error;
+
+    const response = await apiGlobal.get(`${fallbackUrl}/instance/fetchInstances`, { timeout: 10000 });
+    return response.data;
+  }
 };
 
 const useFetchInstancesApi = (props?: UseQueryParams<FetchInstancesResponse>) => {
