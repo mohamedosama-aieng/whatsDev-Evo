@@ -28,6 +28,7 @@ const useFetchInstancesApi = (props?: UseQueryParams<FetchInstancesResponse>) =>
     ...props,
     queryKey,
     queryFn: () => fetchInstances(),
+    retry: false,
   });
 };
 

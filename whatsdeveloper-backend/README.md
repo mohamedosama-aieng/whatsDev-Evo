@@ -34,6 +34,8 @@ NODE_ENV=development
 EVOLUTION_API_URL=http://localhost:8080
 EVOLUTION_API_KEY=your-evolution-api-key
 DEFAULT_INSTANCE_NAME=TEST
+# Optional: maximum wait for Evolution media requests (default 120000 ms)
+EVOLUTION_MEDIA_TIMEOUT_MS=120000
 
 # Security
 JWT_SECRET=your-secret-key
@@ -83,6 +85,10 @@ Once running, visit: **http://localhost:3000/api-docs**
 | `/api/send-location` | POST | Send location |
 | `/api/send-contact` | POST | Send contact card |
 | `/api/send-buttons` | POST | Send buttons/list message |
+| `/api/v1/messages/send-sequence` | POST | Queue an ordered sequence and return its ID |
+| `/api/v1/messages/send-sequence/:sequenceId` | GET | Read sequence progress and per-message results |
+
+Sequence submission returns HTTP 202 immediately. Poll the returned `statusUrl` with the same authentication until `status` is `completed` or `completed_with_errors`. An optional `Idempotency-Key` header makes a repeated submission return the existing job instead of creating a duplicate. Per-message `unknown` means Evolution timed out after accepting the request may already have reached WhatsApp; verify delivery before retrying that item. Sequence state currently lives in backend memory and is lost on a backend restart.
 
 ### Instance & Chats
 

@@ -26,6 +26,7 @@ const PORT = process.env.PORT || 3000;
 const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL || 'http://localhost:8080';
 const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || '';
 const DEFAULT_INSTANCE_NAME = process.env.DEFAULT_INSTANCE_NAME || 'TEST';
+const EVOLUTION_MEDIA_TIMEOUT_MS = Number.parseInt(process.env.EVOLUTION_MEDIA_TIMEOUT_MS || '120000', 10);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
 
 // Auto-configuration settings
@@ -84,6 +85,7 @@ const evolutionService = new EvolutionService({
   baseURL: EVOLUTION_API_URL,
   apiKey: EVOLUTION_API_KEY,
   defaultInstance: DEFAULT_INSTANCE_NAME,
+  mediaTimeoutMs: EVOLUTION_MEDIA_TIMEOUT_MS,
 });
 
 const webhookService = WebhookService.getInstance();

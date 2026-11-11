@@ -1,33 +1,37 @@
-import axios, { AxiosInstance } from 'axios';
+import axios from 'axios';
 
 export interface EvolutionConfig {
   baseURL: string;
   apiKey: string;
   defaultInstance: string;
+  mediaTimeoutMs?: number;
 }
 
 export class EvolutionService {
   private baseURL: string;
   private apiKey: string;
   private defaultInstance: string;
+  private mediaTimeoutMs: number;
 
   constructor(config: EvolutionConfig) {
     this.baseURL = config.baseURL;
     this.apiKey = config.apiKey;
     this.defaultInstance = config.defaultInstance;
+    this.mediaTimeoutMs =
+      Number.isFinite(config.mediaTimeoutMs) && config.mediaTimeoutMs! > 0 ? config.mediaTimeoutMs! : 120000;
   }
 
   /**
    * Create axios client with specific API key
    */
-  private getClient(apiKeyOverride?: string) {
+  private getClient(apiKeyOverride?: string, timeout = 30000) {
     return axios.create({
       baseURL: this.baseURL,
       headers: {
         'Content-Type': 'application/json',
         apikey: apiKeyOverride || this.apiKey,
       },
-      timeout: 30000,
+      timeout,
     });
   }
 
@@ -49,7 +53,7 @@ export class EvolutionService {
    */
   async sendImage(phone: string, imageUrl: string, caption?: string, instanceName?: string, apiKeyOverride?: string) {
     const instance = instanceName || this.defaultInstance;
-    const client = this.getClient(apiKeyOverride);
+    const client = this.getClient(apiKeyOverride, this.mediaTimeoutMs);
     const response = await client.post(`/message/sendMedia/${instance}`, {
       number: phone,
       mediatype: 'image',
@@ -64,7 +68,7 @@ export class EvolutionService {
    */
   async sendVideo(phone: string, videoUrl: string, caption?: string, instanceName?: string, apiKeyOverride?: string) {
     const instance = instanceName || this.defaultInstance;
-    const client = this.getClient(apiKeyOverride);
+    const client = this.getClient(apiKeyOverride, this.mediaTimeoutMs);
     const response = await client.post(`/message/sendMedia/${instance}`, {
       number: phone,
       mediatype: 'video',
@@ -99,7 +103,7 @@ export class EvolutionService {
     apiKeyOverride?: string,
   ) {
     const instance = instanceName || this.defaultInstance;
-    const client = this.getClient(apiKeyOverride);
+    const client = this.getClient(apiKeyOverride, this.mediaTimeoutMs);
     const response = await client.post(`/message/sendMedia/${instance}`, {
       number: phone,
       mediatype: 'document',
@@ -245,7 +249,7 @@ export class EvolutionService {
     apiKeyOverride?: string,
   ) {
     const instance = instanceName || this.defaultInstance;
-    const client = this.getClient(apiKeyOverride);
+    const client = this.getClient(apiKeyOverride, this.mediaTimeoutMs);
     const response = await client.post(`/message/sendMedia/${instance}`, {
       number: phone,
       mediatype: mediaType,

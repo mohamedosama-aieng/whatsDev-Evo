@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { createHash, randomUUID } from 'crypto';
 import { EvolutionService } from '../services/evolution.service';
 import { AuthedRequest } from '../middleware/auth.middleware';
 import { resolveSpintax, formatPhoneNumber, delay } from '../services/utils.service';
@@ -80,10 +81,29 @@ interface SequenceRequest {
 interface MessageResult {
   index: number;
   type: string;
-  status: 'sent' | 'failed';
-  queueId?: number;
+  status: 'queued' | 'sending' | 'sent' | 'failed' | 'unknown';
   messageId?: string;
   error?: string;
+}
+
+interface SequenceJob {
+  id: string;
+  instance?: string;
+  phone: string;
+  status: 'queued' | 'running' | 'completed' | 'completed_with_errors';
+  results: MessageResult[];
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  messages: Message[];
+  delayMs: number;
+  key?: string;
+}
+
+interface IdempotencyRecord {
+  sequenceId: string;
+  fingerprint: string;
+  expiresAt: number;
 }
 
 /**
@@ -111,6 +131,9 @@ interface Target {
 }
 
 export class SequenceController {
+  private readonly jobs = new Map<string, SequenceJob>();
+  private readonly idempotencyKeys = new Map<string, IdempotencyRecord>();
+
   constructor(private evolutionService: EvolutionService) {}
 
   async sendSequence(req: Request, res: Response) {
@@ -142,115 +165,203 @@ export class SequenceController {
         });
       }
 
-      // Check instance availability
-      const isAvailable = await this.evolutionService.isInstanceAvailable(target.instance, target.key);
-      if (!isAvailable) {
-        return res.status(400).json({
-          success: false,
-          error: `WhatsApp client not available for instance "${target.instance ?? 'default'}"`,
-        });
-      }
-
       // Format phone
       const phone = formatPhoneNumber(to);
       const chatId = `${phone}@s.whatsapp.net`;
-
-      // Clamp delay
       const actualDelay = Math.max(1000, Math.min(delayMs, 15000));
+      const fingerprint = createHash('sha256')
+        .update(JSON.stringify({ phone, messages, delayMs: actualDelay, instance: target.instance }))
+        .digest('hex');
+      const suppliedKey = req.get('Idempotency-Key') || req.body.idempotencyKey;
+      const idempotencyKey = typeof suppliedKey === 'string' && suppliedKey.trim() ? suppliedKey.trim() : undefined;
 
-      // Process messages sequentially
-      const results: MessageResult[] = [];
-      let sentCount = 0;
-      let failedCount = 0;
-
-      for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-        const msgType = (msg.type || 'text').toLowerCase();
-
-        try {
-          let result: any;
-
-          switch (msgType) {
-            case 'text':
-              result = await this.sendTextMessage(phone, msg as TextMessage, target);
-              break;
-
-            case 'image':
-              result = await this.sendImageMessage(phone, msg as ImageMessage, target);
-              break;
-
-            case 'video':
-              result = await this.sendVideoMessage(phone, msg as VideoMessage, target);
-              break;
-
-            case 'audio':
-            case 'voice':
-            case 'ptt':
-              result = await this.sendAudioMessage(phone, msg as AudioMessage, target);
-              break;
-
-            case 'document':
-              result = await this.sendDocumentMessage(phone, msg as DocumentMessage, target);
-              break;
-
-            case 'location':
-              result = await this.sendLocationMessage(phone, msg as LocationMessage, target);
-              break;
-
-            case 'contact':
-              result = await this.sendContactMessage(phone, msg as ContactMessage, target);
-              break;
-
-            case 'catalog':
-              result = await this.sendCatalogMessage(phone, msg as CatalogMessage, target);
-              break;
-
-            default:
-              throw new Error(`Unknown message type: ${msgType}`);
+      this.removeExpiredRecords();
+      if (idempotencyKey) {
+        const recordKey = `${target.instance ?? 'default'}:${idempotencyKey}`;
+        const existing = this.idempotencyKeys.get(recordKey);
+        if (existing) {
+          if (existing.fingerprint !== fingerprint) {
+            return res.status(409).json({
+              success: false,
+              error: 'Idempotency-Key was already used with a different sequence',
+            });
           }
-
-          results.push({
-            index: i,
-            type: msgType,
-            status: 'sent',
-            queueId: Date.now() + i, // Simulate queue ID
-            messageId: result.key?.id || 'unknown',
-          });
-
-          sentCount++;
-        } catch (error: any) {
-          results.push({
-            index: i,
-            type: msgType,
-            status: 'failed',
-            error: error.message || 'Unknown error',
-          });
-
-          failedCount++;
-        }
-
-        // Apply delay between messages (except after last one)
-        if (i < messages.length - 1) {
-          await delay(actualDelay);
+          const existingJob = this.jobs.get(existing.sequenceId);
+          if (existingJob) return res.status(202).json(this.jobResponse(existingJob, chatId, true));
+          this.idempotencyKeys.delete(recordKey);
         }
       }
 
-      // Response
-      return res.json({
-        success: failedCount === 0,
-        sent: sentCount,
-        failed: failedCount,
-        total: messages.length,
-        chatId,
+      const now = new Date().toISOString();
+      const sequenceId = randomUUID();
+      const job: SequenceJob = {
+        id: sequenceId,
         instance: target.instance,
-        results,
-        timestamp: new Date().toISOString(),
+        phone,
+        status: 'queued',
+        results: messages.map((message, index) => ({
+          index,
+          type: (message.type || 'text').toLowerCase(),
+          status: 'queued',
+        })),
+        createdAt: now,
+        updatedAt: now,
+        messages,
+        delayMs: actualDelay,
+        key: target.key,
+      };
+
+      this.jobs.set(sequenceId, job);
+      if (idempotencyKey) {
+        this.idempotencyKeys.set(`${target.instance ?? 'default'}:${idempotencyKey}`, {
+          sequenceId,
+          fingerprint,
+          expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+        });
+      }
+
+      // A timeout from the caller must not cause a replay of a long-running sequence.
+      void this.processSequence(job).catch((error) => {
+        console.error(`[sendSequence] Background job ${sequenceId} failed:`, error);
       });
+
+      return res.status(202).json(this.jobResponse(job, chatId));
     } catch (error: any) {
       return res.status(500).json({
         success: false,
         error: error.message || 'Internal server error',
       });
+    }
+  }
+
+  getSequenceStatus(req: Request, res: Response) {
+    const areq = req as AuthedRequest;
+    const job = this.jobs.get(req.params.sequenceId);
+    if (!job || job.instance !== areq.instanceName) {
+      return res.status(404).json({ success: false, error: 'Sequence not found' });
+    }
+
+    return res.json(this.jobResponse(job, `${job.phone}@s.whatsapp.net`));
+  }
+
+  private async processSequence(job: SequenceJob) {
+    job.status = 'running';
+    this.touch(job);
+
+    try {
+      const available = await this.evolutionService.isInstanceAvailable(job.instance, job.key);
+      if (!available) {
+        for (const result of job.results) {
+          result.status = 'failed';
+          result.error = `WhatsApp client not available for instance "${job.instance ?? 'default'}"`;
+        }
+        return;
+      }
+
+      const target: Target = { instance: job.instance, key: job.key };
+      for (let i = 0; i < job.messages.length; i++) {
+        const msg = job.messages[i];
+        const result = job.results[i];
+        result.status = 'sending';
+        this.touch(job);
+
+        try {
+          const response = await this.sendMessage(job.phone, msg, target);
+          result.status = 'sent';
+          result.messageId = response?.key?.id || 'unknown';
+        } catch (error: any) {
+          const message = error?.message || 'Unknown error';
+          const isTimeout = error?.code === 'ECONNABORTED' || error?.code === 'ETIMEDOUT' || /timeout/i.test(message);
+          result.status = isTimeout ? 'unknown' : 'failed';
+          result.error = message;
+        }
+
+        this.touch(job);
+        if (i < job.messages.length - 1) await delay(job.delayMs);
+      }
+    } catch (error: any) {
+      const message = error?.message || 'Sequence processing failed';
+      for (const result of job.results) {
+        if (result.status === 'queued' || result.status === 'sending') {
+          result.status = 'failed';
+          result.error = message;
+        }
+      }
+    } finally {
+      job.status = job.results.some((result) => result.status === 'failed' || result.status === 'unknown')
+        ? 'completed_with_errors'
+        : 'completed';
+      job.completedAt = new Date().toISOString();
+      job.key = undefined;
+      this.touch(job);
+    }
+  }
+
+  private async sendMessage(phone: string, msg: Message, target: Target): Promise<any> {
+    switch ((msg.type || 'text').toLowerCase()) {
+      case 'text':
+        return this.sendTextMessage(phone, msg as TextMessage, target);
+      case 'image':
+        return this.sendImageMessage(phone, msg as ImageMessage, target);
+      case 'video':
+        return this.sendVideoMessage(phone, msg as VideoMessage, target);
+      case 'audio':
+      case 'voice':
+      case 'ptt':
+        return this.sendAudioMessage(phone, msg as AudioMessage, target);
+      case 'document':
+        return this.sendDocumentMessage(phone, msg as DocumentMessage, target);
+      case 'location':
+        return this.sendLocationMessage(phone, msg as LocationMessage, target);
+      case 'contact':
+        return this.sendContactMessage(phone, msg as ContactMessage, target);
+      case 'catalog':
+        return this.sendCatalogMessage(phone, msg as CatalogMessage, target);
+      default:
+        throw new Error(`Unknown message type: ${msg.type}`);
+    }
+  }
+
+  private jobResponse(job: SequenceJob, chatId: string, duplicate = false) {
+    const sent = job.results.filter((result) => result.status === 'sent').length;
+    const failed = job.results.filter((result) => result.status === 'failed').length;
+    const unknown = job.results.filter((result) => result.status === 'unknown').length;
+    return {
+      success: job.status === 'queued' || job.status === 'running' || job.status === 'completed',
+      status: job.status,
+      sequenceId: job.id,
+      duplicate,
+      sent,
+      failed,
+      unknown,
+      total: job.results.length,
+      chatId,
+      instance: job.instance,
+      statusUrl: `/api/v1/messages/send-sequence/${job.id}`,
+      results: job.results.map(({ index, type, status, messageId, error }) => ({
+        index,
+        type,
+        status,
+        ...(messageId !== undefined ? { messageId } : {}),
+        ...(error ? { error } : {}),
+      })),
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      ...(job.completedAt ? { completedAt: job.completedAt } : {}),
+    };
+  }
+
+  private touch(job: SequenceJob) {
+    job.updatedAt = new Date().toISOString();
+  }
+
+  private removeExpiredRecords() {
+    const now = Date.now();
+    for (const [key, record] of this.idempotencyKeys) {
+      if (record.expiresAt <= now) this.idempotencyKeys.delete(key);
+    }
+    for (const [id, job] of this.jobs) {
+      if (job.completedAt && now - Date.parse(job.completedAt) > 24 * 60 * 60 * 1000) this.jobs.delete(id);
     }
   }
 

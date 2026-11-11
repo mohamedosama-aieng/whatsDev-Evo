@@ -58,6 +58,9 @@ export function createRouter(
   router.post('/api/v1/messages/send-sequence', authMiddleware, (req, res) =>
     sequenceController.sendSequence(req, res),
   );
+  router.get('/api/v1/messages/send-sequence/:sequenceId', authMiddleware, (req, res) =>
+    sequenceController.getSequenceStatus(req, res),
+  );
 
   // Webhook routes
   router.post('/api/webhook/register', authMiddleware, (req, res) => webhookController.registerWebhook(req, res));
