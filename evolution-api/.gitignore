@@ -34,7 +34,9 @@ lerna-debug.log*
 # Project related
 /instances/*
 !/instances/.gitkeep
-/test/
+/test/*
+!/test/ack-status.test.ts
+!/test/priority-event-queue.test.ts
 /src/env.yml
 /store
 *.env

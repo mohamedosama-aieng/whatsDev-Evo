@@ -26,6 +26,7 @@ import compression from 'compression';
 import cors from 'cors';
 import express, { json, NextFunction, Request, Response, urlencoded } from 'express';
 import { join } from 'path';
+import { monitorEventLoopDelay } from 'perf_hooks';
 
 async function initWA() {
   await waMonitor.loadInstance();
@@ -33,6 +34,23 @@ async function initWA() {
 
 async function bootstrap() {
   const logger = new Logger('SERVER');
+  const eventLoopDelay = monitorEventLoopDelay({ resolution: 100 });
+  eventLoopDelay.enable();
+  const diagnosticsTimer = setInterval(() => {
+    const maxDelayMs = Math.round(eventLoopDelay.max / 1e6);
+    if (maxDelayMs >= 5000) {
+      logger.warn({
+        event: 'wa.process.stalled',
+        observedAt: new Date().toISOString(),
+        pid: process.pid,
+        maxEventLoopDelayMs: maxDelayMs,
+        rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+        uptimeSeconds: Math.round(process.uptime()),
+      });
+    }
+    eventLoopDelay.reset();
+  }, 30000);
+  diagnosticsTimer.unref();
   const app = express();
 
   let providerFiles: ProviderFiles = null;

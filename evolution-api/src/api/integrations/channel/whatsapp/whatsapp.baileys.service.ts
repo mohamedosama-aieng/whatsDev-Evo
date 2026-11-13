@@ -82,10 +82,18 @@ import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
+import { registerStatusAck } from '@utils/ack-status';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
+import {
+  eventPriority,
+  isStatusOnly,
+  isStatusRegression,
+  PriorityEventQueue,
+  splitQueuedEvents,
+} from '@utils/priority-event-queue';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -253,7 +261,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
-  private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private readonly eventProcessingQueue = new PriorityEventQueue();
+  private eventQueueDepth = 0;
+  private socketSequence = 0;
+  private credentialsQueue: Promise<void> = Promise.resolve();
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -698,7 +709,46 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    const socketId = ++this.socketSequence;
+    const socketStartedAt = Date.now();
+    socketConfig.logger = P({
+      level: this.logBaileys,
+      base: { pid: process.pid, instance: this.instanceName, socketId },
+    });
     this.client = makeWASocket(socketConfig);
+    const socket = this.client;
+    registerStatusAck(socket, (result) => {
+      const diagnostic = { ...result, observedAt: new Date().toISOString(), instance: this.instanceName, socketId };
+      if (result.event === 'wa.status.ack_failed') this.logger.warn(diagnostic);
+      else this.logger.info(diagnostic);
+    });
+    let openedAt: number | undefined;
+    socket.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+      if (!connection) return;
+      if (connection === 'open') openedAt = Date.now();
+      const error = lastDisconnect?.error as Boom | undefined;
+      const code = error?.output?.statusCode;
+      // Observe closure before the message queue can delay connectionUpdate.
+      const diagnostic = {
+        event: 'wa.connection',
+        observedAt: new Date().toISOString(),
+        instance: this.instanceName,
+        socketId,
+        connection,
+        code,
+        reason: code === undefined ? undefined : DisconnectReason[code],
+        message: error?.message?.slice(0, 300),
+        disconnectAt: lastDisconnect?.date?.toISOString(),
+        socketAgeMs: Date.now() - socketStartedAt,
+        connectedForMs: openedAt ? Date.now() - openedAt : undefined,
+        queueDepth: this.eventQueueDepth,
+        wsOpen: socket.ws.isOpen,
+        currentSocket: this.client === socket,
+        processUptimeSeconds: Math.round(process.uptime()),
+      };
+      if (connection === 'close') this.logger.warn(diagnostic);
+      else this.logger.info(diagnostic);
+    });
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
@@ -1203,12 +1253,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const hasMediaPayload = Boolean(
             received?.message?.imageMessage ||
-              received?.message?.videoMessage ||
-              received?.message?.stickerMessage ||
-              received?.message?.documentMessage ||
-              received?.message?.documentWithCaptionMessage ||
-              received?.message?.ptvMessage ||
-              received?.message?.audioMessage,
+            received?.message?.videoMessage ||
+            received?.message?.stickerMessage ||
+            received?.message?.documentMessage ||
+            received?.message?.documentWithCaptionMessage ||
+            received?.message?.ptvMessage ||
+            received?.message?.audioMessage,
           );
 
           // Text messages (including click-to-chat ad messages) do not need
@@ -1599,12 +1649,15 @@ export class BaileysStartupService extends ChannelStartupService {
             console.log('[WEBHOOK] No mediaUrl in message, messageType:', messageRaw.messageType);
           }
 
-          console.log('[WEBHOOK] Sending webhook with messageRaw:', JSON.stringify({
-            messageType: messageRaw.messageType,
-            hasMediaUrl: !!messageRaw.mediaUrl,
-            messageMediaUrl: messageRaw.message?.mediaUrl,
-            rootMediaUrl: messageRaw.mediaUrl,
-          }));
+          console.log(
+            '[WEBHOOK] Sending webhook with messageRaw:',
+            JSON.stringify({
+              messageType: messageRaw.messageType,
+              hasMediaUrl: !!messageRaw.mediaUrl,
+              messageMediaUrl: messageRaw.message?.mediaUrl,
+              rootMediaUrl: messageRaw.mediaUrl,
+            }),
+          );
 
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },
@@ -1694,7 +1747,6 @@ export class BaileysStartupService extends ChannelStartupService {
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
 
         if (
           (update.messageTimestamp && update.messageTimestamp === cached) ||
@@ -1776,6 +1828,19 @@ export class BaileysStartupService extends ChannelStartupService {
             message.messageId = findMessage.id;
           }
 
+          if (!message.remoteJid && findMessage?.key?.remoteJid) {
+            message.remoteJid = findMessage.key.remoteJid;
+            key.remoteJid = findMessage.key.remoteJid;
+          }
+          if (!message.remoteJid) {
+            this.logger.warn({
+              event: 'wa.message.update_missing_chat',
+              instance: this.instanceName,
+              messageId: key.id,
+            });
+            continue;
+          }
+
           if (update.message === null && update.status === undefined) {
             this.sendDataWebhook(Events.MESSAGES_DELETE, { ...key, status: 'DELETED' });
 
@@ -1793,7 +1858,29 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          if (findMessage && update.status !== undefined && status[update.status] !== findMessage.status) {
+          const statusRegressed =
+            findMessage && update.status !== undefined && isStatusRegression(findMessage.status, status[update.status]);
+          if (statusRegressed) {
+            this.logger.debug({
+              event: 'wa.message.status_regression_ignored',
+              instance: this.instanceName,
+              messageId: key.id,
+              currentStatus: findMessage.status,
+              incomingStatus: status[update.status],
+            });
+            if (isStatusOnly(update)) continue;
+            message.status = findMessage.status;
+          }
+
+          const isTerminalMessage = findMessage && ['EDITED', 'DELETED'].includes(findMessage.status);
+          if (
+            findMessage &&
+            update.status !== undefined &&
+            !statusRegressed &&
+            status[update.status] !== findMessage.status &&
+            (!isTerminalMessage || status[update.status] === status[4])
+          ) {
+            const isRead = status[update.status] === status[4];
             if (!key.fromMe && key.remoteJid) {
               readChatToUpdate[key.remoteJid] = true;
 
@@ -1805,22 +1892,29 @@ export class BaileysStartupService extends ChannelStartupService {
               const cachedTimestamp = await this.baileysCache.get(messageKey);
 
               if (!cachedTimestamp) {
-                if (status[update.status] === status[4]) {
+                if (isRead) {
                   this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
                   await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
                   await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
                 }
 
-                await this.prismaRepository.message.update({
-                  where: { id: findMessage.id },
-                  data: { status: status[update.status] },
-                });
+                if (!isTerminalMessage) {
+                  await this.prismaRepository.message.update({
+                    where: { id: findMessage.id },
+                    data: { status: status[update.status] },
+                  });
+                }
               } else {
                 this.logger.info(
                   `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
                 );
               }
             }
+          }
+
+          if (isTerminalMessage && update.status !== undefined) {
+            if (isStatusOnly(update)) continue;
+            message.status = findMessage.status;
           }
 
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
@@ -1836,7 +1930,11 @@ export class BaileysStartupService extends ChannelStartupService {
           });
 
           if (existingChat) {
-            const chatToInsert = { remoteJid: message.remoteJid, instanceId: this.instanceId, unreadMessages: 0 };
+            const chatToInsert = {
+              remoteJid: message.remoteJid,
+              instanceId: this.instanceId,
+              unreadMessages: existingChat.unreadMessages,
+            };
 
             this.sendDataWebhook(Events.CHATS_UPSERT, [chatToInsert]);
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
@@ -1997,142 +2095,186 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
-    this.client.ev.process(async (events) => {
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        try {
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+    const socket = this.client;
+    const socketId = this.socketSequence;
+    socket.ev.on('connection.update', (event) => {
+      if (socket !== this.client) return;
+      void this.connectionUpdate(event).catch((error) => this.logger.error(error));
+    });
+    const saveCreds = this.instance.authState.saveCreds;
+    socket.ev.on('creds.update', () => {
+      if (socket !== this.client) return;
+      this.credentialsQueue = this.credentialsQueue.then(() => saveCreds()).catch((error) => this.logger.error(error));
+    });
+    socket.ev.process(async (batch) => {
+      // Share one settings read across split jobs from this batch, without blocking lifecycle events.
+      let settingsPromise: ReturnType<typeof this.findSettings> | undefined;
+      for (const updateBatch of splitQueuedEvents(batch)) {
+        const receivedAt = Date.now();
+        const eventTypes = Object.keys(updateBatch);
+        this.eventQueueDepth++;
+        const priority = eventPriority(updateBatch);
+        this.eventProcessingQueue.add(priority, async () => {
+          const startedAt = Date.now();
+          const queueWaitMs = startedAt - receivedAt;
+          const stalled = setTimeout(() => {
+            this.logger.warn({
+              event: 'wa.queue.stalled',
+              observedAt: new Date().toISOString(),
+              instance: this.instanceName,
+              socketId,
+              eventTypes,
+              priority,
+              queueWaitMs,
+              processingMs: Date.now() - startedAt,
+              queueDepth: this.eventProcessingQueue.size,
+            });
+          }, 30000);
+          stalled.unref();
+          try {
+            if (!this.endSession) {
+              const database = this.configService.get<Database>('DATABASE');
+              const settings = await (settingsPromise ??= this.findSettings());
 
-            if (events.call) {
-              const call = events.call[0];
+              if (updateBatch.call) {
+                const call = updateBatch.call[0];
 
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
-              }
-
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+                if (settings?.rejectCall && call.status == 'offer') {
+                  this.client.rejectCall(call.id, call.from);
                 }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+                  if (call.from.endsWith('@lid')) {
+                    call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+                  }
+                  const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+                  this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                }
+
+                this.sendDataWebhook(Events.CALL, call);
               }
 
-              this.sendDataWebhook(Events.CALL, call);
-            }
+              if (updateBatch['messaging-history.set']) {
+                const payload = updateBatch['messaging-history.set'];
+                await this.messageHandle['messaging-history.set'](payload);
+              }
 
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
-            }
+              if (updateBatch['messages.upsert']) {
+                const payload = updateBatch['messages.upsert'];
 
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
+                // this.messageProcessor.processMessage(payload, settings);
+                await this.messageHandle['messages.upsert'](payload, settings);
+              }
 
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              await this.messageHandle['messaging-history.set'](payload);
-            }
+              if (updateBatch['messages.update']) {
+                const payload = updateBatch['messages.update'];
+                await this.messageHandle['messages.update'](payload, settings);
+              }
 
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
+              if (updateBatch['message-receipt.update']) {
+                const payload = updateBatch['message-receipt.update'] as MessageUserReceiptUpdate[];
+                const remotesJidMap: Record<string, number> = {};
 
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
+                for (const event of payload) {
+                  if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                    remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                  }
+                }
 
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
+                await Promise.all(
+                  Object.keys(remotesJidMap).map(async (remoteJid) =>
+                    this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+                  ),
+                );
+              }
 
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
+              if (updateBatch['presence.update']) {
+                const payload = updateBatch['presence.update'];
 
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+                  return;
+                }
+
+                this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+              }
+
+              if (!settings?.groupsIgnore) {
+                if (updateBatch['groups.upsert']) {
+                  const payload = updateBatch['groups.upsert'];
+                  this.groupHandler['groups.upsert'](payload);
+                }
+
+                if (updateBatch['groups.update']) {
+                  const payload = updateBatch['groups.update'];
+                  this.groupHandler['groups.update'](payload);
+                }
+
+                if (updateBatch['group-participants.update']) {
+                  const payload = updateBatch['group-participants.update'] as any;
+                  this.groupHandler['group-participants.update'](payload);
                 }
               }
 
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
-            }
+              if (updateBatch['chats.upsert']) {
+                const payload = updateBatch['chats.upsert'];
+                this.chatHandle['chats.upsert'](payload);
+              }
 
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
+              if (updateBatch['chats.update']) {
+                const payload = updateBatch['chats.update'];
+                this.chatHandle['chats.update'](payload);
+              }
 
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+              if (updateBatch['chats.delete']) {
+                const payload = updateBatch['chats.delete'];
+                this.chatHandle['chats.delete'](payload);
+              }
+
+              if (updateBatch['contacts.upsert']) {
+                const payload = updateBatch['contacts.upsert'];
+                this.contactHandle['contacts.upsert'](payload);
+              }
+
+              if (updateBatch['contacts.update']) {
+                const payload = updateBatch['contacts.update'];
+                this.contactHandle['contacts.update'](payload);
+              }
+
+              if (updateBatch[Events.LABELS_ASSOCIATION]) {
+                const payload = updateBatch[Events.LABELS_ASSOCIATION];
+                this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
                 return;
               }
 
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
+              if (updateBatch[Events.LABELS_EDIT]) {
+                const payload = updateBatch[Events.LABELS_EDIT];
+                this.labelHandle[Events.LABELS_EDIT](payload);
+                return;
               }
             }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
+          } catch (error) {
+            this.logger.error(error);
+          } finally {
+            clearTimeout(stalled);
+            this.eventQueueDepth--;
+            const processingMs = Date.now() - startedAt;
+            if (queueWaitMs >= 5000 || processingMs >= 5000) {
+              this.logger.warn({
+                event: 'wa.queue.slow',
+                observedAt: new Date().toISOString(),
+                instance: this.instanceName,
+                socketId,
+                eventTypes,
+                priority,
+                queueWaitMs,
+                processingMs,
+                queueDepth: this.eventProcessingQueue.size,
+              });
             }
           }
-        } catch (error) {
-          this.logger.error(error);
-        }
-      });
+        });
+      }
     });
   }
 
@@ -2170,7 +2312,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const jid = createJid(number);
 
     try {
-      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
+      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image', 3000);
 
       return { wuid: jid, profilePictureUrl };
     } catch {
@@ -3006,7 +3148,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const response = await axios.get(mediaMessage.media, config);
 
-          mimetype = response.headers['content-type'];
+          const contentType = response.headers['content-type'];
+          if (typeof contentType === 'string') mimetype = contentType;
         }
       }
 
@@ -4924,7 +5067,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (result) {
       if (result > 0) {
-        this.updateChatUnreadMessages(remoteJid);
+        await this.updateChatUnreadMessages(remoteJid);
       }
 
       return result;
@@ -4935,7 +5078,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async updateChatUnreadMessages(remoteJid: string): Promise<number> {
     const [chat, unreadMessages] = await Promise.all([
-      this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
+      this.prismaRepository.chat.findFirst({ where: { remoteJid, instanceId: this.instanceId } }),
       // Use raw SQL to avoid JSON path issues
       this.prismaRepository.$queryRaw`
         SELECT COUNT(*)::int as count FROM "Message"
